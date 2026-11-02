@@ -184,8 +184,6 @@ def load_ap(file_bytes: bytes) -> pd.DataFrame:
 
 # =========================================================
 # Сопоставление — векторизованное
-# ВАЖНО: без `_fin`/`_ap` — чтобы Streamlit кешировал по содержимому DataFrame
-# и сбрасывал кеш при загрузке нового файла.
 # =========================================================
 @st.cache_data(show_spinner=False)
 def match(fin: pd.DataFrame, ap: pd.DataFrame, eps_m: float = EPS_M) -> pd.DataFrame:
@@ -239,7 +237,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, eps_m: float = EPS_M) -> pd.DataF
         fin_idx_city = np.array(list(fin_idx_city))
         fin_coords = fin.loc[fin_idx_city, ["Широта", "Долгота"]].to_numpy()
 
-        # радиус в градусах с учётом cos(lat); query_ball_point требует скаляр — берём максимум
         cos_lat = np.clip(np.cos(np.radians(fin_coords[:, 0])), 0.1, 1.0)
         r_deg = (eps_m * 3.0) / 111320.0 / cos_lat
         r_max = float(np.max(r_deg))
@@ -284,6 +281,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, eps_m: float = EPS_M) -> pd.DataF
     # ---------- Сборка ----------
     fin["Совпадение по адресу (ДА/НЕТ)"] = np.where(addr_ok, "ДА", "НЕТ")
     fin["Совпадение по ГЕО (ДА/НЕТ)"] = np.where(geo_ok, "ДА", "НЕТ")
+    fin["Совпадение по Адресу ИЛИ ГЕО (ДА/НЕТ)"] = np.where(addr_ok | geo_ok, "ДА", "НЕТ")
 
     chosen_ap_idx = addr_ap_idx.where(addr_ok, geo_ap_idx)
 
@@ -330,6 +328,7 @@ if file_fin and file_ap:
         "АК наименование", "УА ПЛАНОГРАММЫ", "СТАТУС МАГАЗИНА", "Адрес",
         "город", "Широта", "Долгота",
         "Совпадение по адресу (ДА/НЕТ)", "Совпадение по ГЕО (ДА/НЕТ)",
+        "Совпадение по Адресу ИЛИ ГЕО (ДА/НЕТ)",
         "ID_Точки_ap", "название_ap", "адрес_ap",
         "Широта_ap", "Долгота_ap",
         "Полигон_ap", "город_ap", "тип_ap", "сеть_ap", "база_ap",
@@ -348,19 +347,13 @@ if file_fin and file_ap:
 
     assert result_out.columns.is_unique, f"Duplicate columns: {list(result_out.columns)}"
 
-
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
         result_out.to_excel(w, index=False, sheet_name="Результат")
 
         addr_da = int((result_out["Совпадение по адресу (ДА/НЕТ)"] == "ДА").sum())
         geo_da = int((result_out["Совпадение по ГЕО (ДА/НЕТ)"] == "ДА").sum())
-        any_da = int(
-            (
-                (result_out["Совпадение по адресу (ДА/НЕТ)"] == "ДА")
-                | (result_out["Совпадение по ГЕО (ДА/НЕТ)"] == "ДА")
-            ).sum()
-        )
+        any_da = int((result_out["Совпадение по Адресу ИЛИ ГЕО (ДА/НЕТ)"] == "ДА").sum())
         metrics = pd.DataFrame({
             "Показатель": [
                 "Всего строк",
