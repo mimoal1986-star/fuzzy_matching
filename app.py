@@ -1,7 +1,6 @@
 # app.py
 import re
 import io
-from math import radians
 
 import numpy as np
 import pandas as pd
@@ -65,12 +64,6 @@ FIN_ADDR_RE = re.compile(
     re.IGNORECASE,
 )
 
-def _prep_text(s: pd.Series) -> pd.Series:
-    s = s.astype(str).str.lower().str.replace("ё", "е", regex=False)
-    s = s.str.replace(GARBAGE_RE, " ", regex=True)
-    s = s.str.replace(r"\s+", " ", regex=True).str.strip()
-    return s
-
 def _clean_street(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.lower().str.replace("ё", "е", regex=False)
     s = s.str.replace(TYPE_RE, " ", regex=True)
@@ -89,14 +82,14 @@ def parse_fin_series(addr: pd.Series, city: pd.Series):
     s = addr.astype(str).str.lower().str.replace("ё", "е", regex=False)
     s = s.str.replace(REGION_CITY_RE, " ", regex=True)
 
-    # убрать город-подсказку (по строкам)
-    city_lower = city.astype(str).str.lower()
-    s = s.where(~s.str.contains(city_lower, na=False),
-                s.apply(lambda x: x), s)  # no-op заглушка, ниже нормальная чистка
-    # простая построчная чистка города без apply:
-    s = s.to_frame("s").assign(city=city_lower.values).apply(
-        lambda r: r["s"].replace(r["city"], " ") if r["city"] else r["s"], axis=1
-    )
+    # --- убрать город-подсказку из строки адреса, без apply(axis=1) ---
+    city_clean = city.fillna("").astype(str).str.lower().to_numpy()
+    s_clean = s.fillna("").astype(str).to_numpy()
+    s_clean = [
+        s_i.replace(c_i, " ") if c_i and c_i in s_i else s_i
+        for s_i, c_i in zip(s_clean, city_clean)
+    ]
+    s = pd.Series(s_clean, index=s.index)
 
     s = s.str.replace(GARBAGE_RE, " ", regex=True)
     s = s.str.replace(r"\s+", " ", regex=True).str.strip()
@@ -117,19 +110,27 @@ def parse_ap_series(addr: pd.Series):
     s = addr.astype(str).str.lower().str.replace("ё", "е", regex=False)
     s = s.str.replace(GARBAGE_RE, " ", regex=True)
 
-    # дом по "д." или "дом"
-    extracted = s.str.extract(DOM_RE)
-    house_raw = extracted[0].fillna("")
+    # дом по "д." / "дом" (без групп в regex, чтобы не ловить сюрпризы)
+    house_extract = s.str.extract(r"(?:д\.?|дом)\s*([0-9]+[0-9a-zA-Zа-яА-Я/\-]*)")
+    house_raw = house_extract[0].fillna("")
     has_dom = house_raw.ne("")
-    s_street = s.where(~has_dom, s.str.split(DOM_RE, n=1).str[0])
+
+    # обрезаем строку по позиции "д." / "дом" (без regex-групп)
+    starts = s.str.find(r"\b(?:д\.?|дом)\s*[0-9]", regex=True)
+    s_street = s.copy()
+    mask = starts >= 0
+    if mask.any():
+        s_street.loc[mask] = s.loc[mask].str.slice(0, starts.loc[mask].astype(int).values)
 
     # fallback: если "д." нет — последнее число = дом
     fallback = s_street.str.extract(r"([0-9]+[0-9a-zA-Zа-яА-Я/]*)\s*$")
     fallback_house = fallback[0].fillna("")
     need_fallback = (~has_dom) & fallback_house.ne("")
     house_raw = house_raw.where(has_dom, fallback_house)
-    s_street = s_street.where(~need_fallback,
-                               s_street.str.replace(r"([0-9]+[0-9a-zA-Zа-яА-Я/]*)\s*$", "", regex=True))
+    if need_fallback.any():
+        s_street.loc[need_fallback] = s_street.loc[need_fallback].str.replace(
+            r"[0-9]+[0-9a-zA-Zа-яА-Я/]*\s*$", "", regex=True
+        )
 
     s_street = s_street.str.replace(r"[;]+", " ", regex=True)
     s_street = s_street.str.replace(r"\s+", " ", regex=True).str.strip()
@@ -144,7 +145,7 @@ def to_float_series(s: pd.Series) -> pd.Series:
     )
 
 # =========================================================
-# Haversine — numpy-версия
+# Haversine — numpy
 # =========================================================
 R_EARTH = 6371000.0
 
@@ -193,14 +194,17 @@ def match(_fin: pd.DataFrame, _ap: pd.DataFrame, eps_m: float = EPS_M) -> pd.Dat
 
     # ---------- Адресный канал через merge ----------
     fin_key = fin.reset_index()[["index", "_city_norm", "_street", "_house"]].copy()
-    fin_key = fin_key[(fin_key["_street"] != "") & (fin_key["_house"] != "") & (fin_key["_city_norm"] != "")]
+    fin_key = fin_key[
+        (fin_key["_street"] != "") & (fin_key["_house"] != "") & (fin_key["_city_norm"] != "")
+    ]
 
     ap_key = ap[["_city_norm", "_street", "_house"]].copy()
     ap_key["_ap_idx"] = np.arange(len(ap))
-    ap_key = ap_key[(ap_key["_street"] != "") & (ap_key["_house"] != "") & (ap_key["_city_norm"] != "")]
+    ap_key = ap_key[
+        (ap_key["_street"] != "") & (ap_key["_house"] != "") & (ap_key["_city_norm"] != "")
+    ]
 
     cand = fin_key.merge(ap_key, on=["_city_norm", "_street", "_house"], how="inner")
-    # cand: index (фин), _ap_idx (ап)
 
     addr_ok = pd.Series(False, index=fin.index)
     addr_ap_idx = pd.Series(np.nan, index=fin.index)
@@ -212,38 +216,36 @@ def match(_fin: pd.DataFrame, _ap: pd.DataFrame, eps_m: float = EPS_M) -> pd.Dat
         ap_lon = ap.loc[cand["_ap_idx"], "Долгота"].to_numpy()
         cand = cand.copy()
         cand["_dist"] = haversine_np(fin_lat, fin_lon, ap_lat, ap_lon)
-        # оставляем ближайшего адресного кандидата на каждый фин-индекс
         cand_best = cand.sort_values("_dist").drop_duplicates("index", keep="first")
-        addr_ok.loc[cand_best["index"]] = True
-        addr_ap_idx.loc[cand_best["index"]] = cand_best["_ap_idx"].values
+        addr_ok.loc[cand_best["index"].values] = True
+        addr_ap_idx.loc[cand_best["index"].values] = cand_best["_ap_idx"].values
 
     # ---------- Гео-канал через KDTree батчем ----------
     geo_ok = pd.Series(False, index=fin.index)
     geo_ap_idx = pd.Series(np.nan, index=fin.index)
-    geo_dist_best = pd.Series(np.inf, index=fin.index)
 
-    fin_valid_mask = fin["Широта"].notna() & fin["Долгота"].notna() & (fin["_city_norm"] != "")
+    fin_valid_mask = (
+        fin["Широта"].notna() & fin["Долгота"].notna() & (fin["_city_norm"] != "")
+    )
 
     for city, fin_idx_city in fin[fin_valid_mask].groupby("_city_norm").groups.items():
         ap_idx_city = ap.index[ap["_city_norm"] == city]
         if len(ap_idx_city) == 0:
             continue
+
         ap_coords = ap.loc[ap_idx_city, ["Широта", "Долгота"]].to_numpy()
         tree = cKDTree(ap_coords)
 
         fin_idx_city = np.array(list(fin_idx_city))
         fin_coords = fin.loc[fin_idx_city, ["Широта", "Долгота"]].to_numpy()
 
-        # радиус в градусах с учётом cos(lat)
-        cos_lat = np.cos(np.radians(fin_coords[:, 0]))
-        cos_lat = np.clip(cos_lat, 0.1, 1.0)
-        r_deg = (eps_m * 3.0) / 111320.0 / cos_lat  # массив радиусов
-
-        # query_ball_point не принимает массив r, поэтому берём максимальный
+        # радиус в градусах с учётом cos(lat); query_ball_point требует скаляр — берём максимум
+        cos_lat = np.clip(np.cos(np.radians(fin_coords[:, 0])), 0.1, 1.0)
+        r_deg = (eps_m * 3.0) / 111320.0 / cos_lat
         r_max = float(np.max(r_deg))
+
         neighbours = tree.query_ball_point(fin_coords, r_max)
 
-        # собираем плоские пары (локальный индекс фин-точки, локальный индекс ап)
         fin_local = []
         ap_local = []
         for i, lst in enumerate(neighbours):
@@ -270,19 +272,16 @@ def match(_fin: pd.DataFrame, _ap: pd.DataFrame, eps_m: float = EPS_M) -> pd.Dat
         ap_local = ap_local[mask]
         dist = dist[mask]
 
-        # глобальные индексы
         fin_global = fin_idx_city[fin_local]
         ap_global = ap_idx_city[ap_local]
 
-        # оставляем ближайшего гео-соседа на каждый фин-индекс
         tmp = pd.DataFrame({"fin": fin_global, "ap": ap_global, "d": dist})
         tmp = tmp.sort_values("d").drop_duplicates("fin", keep="first")
 
         geo_ok.loc[tmp["fin"].values] = True
         geo_ap_idx.loc[tmp["fin"].values] = tmp["ap"].values
-        geo_dist_best.loc[tmp["fin"].values] = tmp["d"].values
 
-    # ---------- Сборка: приоритет вывода — адрес, иначе гео ----------
+    # ---------- Сборка ----------
     fin["Совпадение по адресу (ДА/НЕТ)"] = np.where(addr_ok, "ДА", "НЕТ")
     fin["Совпадение по ГЕО (ДА/НЕТ)"] = np.where(geo_ok, "ДА", "НЕТ")
 
@@ -292,7 +291,6 @@ def match(_fin: pd.DataFrame, _ap: pd.DataFrame, eps_m: float = EPS_M) -> pd.Dat
         "ID_Точки", "название", "адрес", "Широта", "Долгота",
         "Полигон", "город", "тип", "сеть", "база",
     ]
-    # все выбранные ап-индексы
     chosen_valid = chosen_ap_idx.dropna()
     ap_lookup = ap.loc[chosen_valid.astype(int).values, ap_out_cols].copy()
     ap_lookup.index = chosen_valid.index
@@ -344,7 +342,6 @@ if file_fin and file_ap:
         "база_ap": "база",
     })
 
-    # защита от дублей колонок — на всякий случай
     assert result_out.columns.is_unique, f"Duplicate columns: {list(result_out.columns)}"
 
     bio = io.BytesIO()
@@ -375,7 +372,7 @@ if file_fin and file_ap:
     bio.seek(0)
 
     st.success("Готово.")
-    st.dataframe(result_out.head(50), width="stretch")
+    st.dataframe(result_out.head(50), use_container_width=True)
     st.download_button(
         label="Скачать результат (.xlsx)",
         data=bio,
