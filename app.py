@@ -32,6 +32,7 @@ def norm_city_series(s: pd.Series) -> pd.Series:
     out = out.str.replace(r"\s+", " ", regex=True).str.strip()
     out = out.map(lambda x: CITY_SYNONYMS.get(x, CITY_SYNONYMS.get(x.replace(" ", ""), x)))
     out = out.where(out != "nan", "")
+    out = out.where(out != "none", "")
     return out
 
 # =========================================================
@@ -58,9 +59,10 @@ REGION_CITY_RE = re.compile(
 
 DOM_RE = re.compile(r"(?:д\.?|дом)\s*([0-9]+[0-9a-zA-Zа-яА-Я/\-]*)", re.IGNORECASE)
 
-# для фин-апа: улица + маркер + дом одной regex
+# для фин-апа: улица + маркер + дом одной regex.
+# ВАЖНО: маркер отделён пробелами (\s+), чтобы не срабатывать на «улица» внутри названия улицы.
 FIN_ADDR_RE = re.compile(
-    rf"^(?P<street>.*?)\s*(?P<type>{TYPE_PATTERN})\b\.?\s*(?P<house>[0-9]+[0-9a-zA-Zа-яА-Я/\-]*)",
+    rf"^(?P<street>.*?)\s+(?P<type>{TYPE_PATTERN})\b\.?\s+(?P<house>[0-9]+[0-9a-zA-Zа-яА-Я/\-]*)",
     re.IGNORECASE,
 )
 
@@ -110,19 +112,15 @@ def parse_ap_series(addr: pd.Series):
     s = addr.astype(str).str.lower().str.replace("ё", "е", regex=False)
     s = s.str.replace(GARBAGE_RE, " ", regex=True)
 
-    # дом по "д." / "дом" (без групп в regex, чтобы не ловить сюрпризы)
-    house_extract = s.str.extract(r"(?:д\.?|дом)\s*([0-9]+[0-9a-zA-Zа-яА-Я/\-]*)")
-    house_raw = house_extract[0].fillna("")
+    # дом по "д." / "дом"
+    house_raw = s.str.extract(r"(?:д\.?|дом)\s*([0-9]+[0-9a-zA-Zа-яА-Я/\-]*)")[0].fillna("")
     has_dom = house_raw.ne("")
 
-    # обрезаем строку по позиции "д." / "дом" (без regex-групп)
-    starts = s.str.find(r"\b(?:д\.?|дом)\s*[0-9]", regex=True)
-    s_street = s.copy()
-    mask = starts >= 0
-    if mask.any():
-        s_street.loc[mask] = s.loc[mask].str.slice(0, starts.loc[mask].astype(int).values)
+    # обрезаем строку по первому "д." / "дом" — через .str.split (regex=True поддерживается)
+    parts = s.str.split(r"(?:д\.?|дом)\s*[0-9]", n=1, regex=True, expand=True)
+    s_street = parts[0].where(has_dom, s)
 
-    # fallback: если "д." нет — последнее число = дом
+    # fallback: если "д." нет — последнее число в строке = дом
     fallback = s_street.str.extract(r"([0-9]+[0-9a-zA-Zа-яА-Я/]*)\s*$")
     fallback_house = fallback[0].fillna("")
     need_fallback = (~has_dom) & fallback_house.ne("")
@@ -186,11 +184,13 @@ def load_ap(file_bytes: bytes) -> pd.DataFrame:
 
 # =========================================================
 # Сопоставление — векторизованное
+# ВАЖНО: без `_fin`/`_ap` — чтобы Streamlit кешировал по содержимому DataFrame
+# и сбрасывал кеш при загрузке нового файла.
 # =========================================================
 @st.cache_data(show_spinner=False)
-def match(_fin: pd.DataFrame, _ap: pd.DataFrame, eps_m: float = EPS_M) -> pd.DataFrame:
-    fin = _fin.copy()
-    ap = _ap.dropna(subset=["Широта", "Долгота"]).reset_index(drop=True)
+def match(fin: pd.DataFrame, ap: pd.DataFrame, eps_m: float = EPS_M) -> pd.DataFrame:
+    fin = fin.copy()
+    ap = ap.dropna(subset=["Широта", "Долгота"]).reset_index(drop=True)
 
     # ---------- Адресный канал через merge ----------
     fin_key = fin.reset_index()[["index", "_city_norm", "_street", "_house"]].copy()
@@ -292,8 +292,11 @@ def match(_fin: pd.DataFrame, _ap: pd.DataFrame, eps_m: float = EPS_M) -> pd.Dat
         "Полигон", "город", "тип", "сеть", "база",
     ]
     chosen_valid = chosen_ap_idx.dropna()
-    ap_lookup = ap.loc[chosen_valid.astype(int).values, ap_out_cols].copy()
-    ap_lookup.index = chosen_valid.index
+    if len(chosen_valid) > 0:
+        ap_lookup = ap.loc[chosen_valid.astype(int).values, ap_out_cols].copy()
+        ap_lookup.index = chosen_valid.index
+    else:
+        ap_lookup = pd.DataFrame(columns=ap_out_cols, index=fin.index)
 
     for c in ap_out_cols:
         fin[c + "_ap"] = ap_lookup[c].reindex(fin.index)
@@ -372,7 +375,7 @@ if file_fin and file_ap:
     bio.seek(0)
 
     st.success("Готово.")
-    st.dataframe(result_out.head(50), use_container_width=True)
+    st.dataframe(result_out.head(50), width="stretch")
     st.download_button(
         label="Скачать результат (.xlsx)",
         data=bio,
