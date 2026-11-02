@@ -1,7 +1,7 @@
 # app.py
 import re
 import io
-from math import radians, sin, cos, asin, sqrt
+from math import radians
 
 import numpy as np
 import pandas as pd
@@ -27,34 +27,24 @@ CITY_SYNONYMS = {
     "ростов на дону": "ростов-на-дону",
 }
 
-def norm_city(s):
-    if pd.isna(s):
-        return ""
-    s = str(s).strip().lower().replace("ё", "е")
-    s = re.sub(r"[.,;]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    if not s:
-        return ""
-    if s in CITY_SYNONYMS:
-        return CITY_SYNONYMS[s]
-    key = s.replace(" ", "")
-    if key in CITY_SYNONYMS:
-        return CITY_SYNONYMS[key]
-    return s
+def norm_city_series(s: pd.Series) -> pd.Series:
+    out = s.astype(str).str.strip().str.lower().str.replace("ё", "е", regex=False)
+    out = out.str.replace(r"[.,;]+", " ", regex=True)
+    out = out.str.replace(r"\s+", " ", regex=True).str.strip()
+    out = out.map(lambda x: CITY_SYNONYMS.get(x, CITY_SYNONYMS.get(x.replace(" ", ""), x)))
+    out = out.where(out != "nan", "")
+    return out
 
 # =========================================================
-# Нормализация адреса
+# Нормализация адреса — векторизованно
 # =========================================================
-TYPE_RE = re.compile(
-    r"\b(пр-кт|пр-т|проспект|пр-д|проезд|просека|просек|переулок|пер|"
+TYPE_PATTERN = (
+    r"пр-кт|пр-т|проспект|пр-д|проезд|просека|просек|переулок|пер|"
     r"бульвар|б-р|набережная|наб|площадь|пл|шоссе|ш|улица|ул|"
     r"аллея|мкр|микрорайон|тракт|тупик|туп|спуск|съезд|дорога|дор|"
-    r"линия|квартал|кв-л|тер|проулок|протока)\b\.?",
-    re.IGNORECASE,
+    r"линия|квартал|кв-л|тер|проулок|протока"
 )
-
-DOM_RE = re.compile(r"(?:д\.?|дом)\s*([0-9]+[0-9a-zA-Zа-яА-Я/\-]*)", re.IGNORECASE)
-HOUSE_AFTER_TYPE_RE = re.compile(r"^\s*([0-9]+[0-9a-zA-Zа-яА-Я/\-]*)")
+TYPE_RE = re.compile(rf"\b({TYPE_PATTERN})\b\.?", re.IGNORECASE)
 
 GARBAGE_RE = re.compile(
     r"\b(пом|помещ|помещение|оф|офис|эт|этаж|кв|квартира|стр|строение|"
@@ -62,231 +52,253 @@ GARBAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# удаляем область/республику/город — БЕЗ бага "г\s"
 REGION_CITY_RE = re.compile(
     r"\b(респ\.?|республика|обл\.?|область|край|г\.|город)\s*",
     re.IGNORECASE,
 )
 
-def clean_street_name(name):
-    if not name:
-        return ""
-    name = name.lower().replace("ё", "е")
-    name = TYPE_RE.sub(" ", name)
-    name = re.sub(r"[.,;:\(\)\"'«»]+", " ", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name
+DOM_RE = re.compile(r"(?:д\.?|дом)\s*([0-9]+[0-9a-zA-Zа-яА-Я/\-]*)", re.IGNORECASE)
 
-def canon_house(h):
-    if not h:
-        return ""
-    h = h.lower().replace("ё", "е")
-    h = h.replace(" ", "").replace("-", "")
-    return h
+# для фин-апа: улица + маркер + дом одной regex
+FIN_ADDR_RE = re.compile(
+    rf"^(?P<street>.*?)\s*(?P<type>{TYPE_PATTERN})\b\.?\s*(?P<house>[0-9]+[0-9a-zA-Zа-яА-Я/\-]*)",
+    re.IGNORECASE,
+)
 
-def parse_addr_fin(addr, city_hint):
-    """Адрес из фин-апа:
-    'Челябинская обл. г.Челябинск Скульптора Головницкого ул 20А пом.1'
-    → ('головницкого', '20а')
-    """
-    if pd.isna(addr):
-        return "", ""
-    s = str(addr).lower().replace("ё", "е")
+def _prep_text(s: pd.Series) -> pd.Series:
+    s = s.astype(str).str.lower().str.replace("ё", "е", regex=False)
+    s = s.str.replace(GARBAGE_RE, " ", regex=True)
+    s = s.str.replace(r"\s+", " ", regex=True).str.strip()
+    return s
 
-    # убрать область/город по маркерам (без "г\s")
-    s = REGION_CITY_RE.sub(" ", s)
-    if city_hint:
-        s = s.replace(city_hint.lower(), " ")
-    s = re.sub(r"\s+", " ", s).strip()
+def _clean_street(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.lower().str.replace("ё", "е", regex=False)
+    s = s.str.replace(TYPE_RE, " ", regex=True)
+    s = s.str.replace(r"[.,;:\(\)\"'«»]+", " ", regex=True)
+    s = s.str.replace(r"\s+", " ", regex=True).str.strip()
+    return s
 
-    # убрать пом/стр/корп и хвост
-    s = GARBAGE_RE.sub(" ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+def _canon_house(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.lower().str.replace("ё", "е", regex=False)
+    s = s.str.replace(" ", "", regex=False).str.replace("-", "", regex=False)
+    s = s.where(s != "nan", "")
+    return s
 
-    m = TYPE_RE.search(s)
-    if not m:
-        return "", ""
+def parse_fin_series(addr: pd.Series, city: pd.Series):
+    """Векторный парсинг адресов фин-апа."""
+    s = addr.astype(str).str.lower().str.replace("ё", "е", regex=False)
+    s = s.str.replace(REGION_CITY_RE, " ", regex=True)
 
-    street = s[: m.start()].strip()
-    words = street.split()
-    # название улицы обычно 1–3 слова — берём последние 3
-    if len(words) > 3:
-        words = words[-3:]
-    street = clean_street_name(" ".join(words))
+    # убрать город-подсказку (по строкам)
+    city_lower = city.astype(str).str.lower()
+    s = s.where(~s.str.contains(city_lower, na=False),
+                s.apply(lambda x: x), s)  # no-op заглушка, ниже нормальная чистка
+    # простая построчная чистка города без apply:
+    s = s.to_frame("s").assign(city=city_lower.values).apply(
+        lambda r: r["s"].replace(r["city"], " ") if r["city"] else r["s"], axis=1
+    )
 
-    after = s[m.end():]
-    hm = HOUSE_AFTER_TYPE_RE.match(after)
-    if hm:
-        house = hm.group(1)
-    else:
-        tail = re.search(r"([0-9]+[0-9a-zA-Zа-яА-Я/]*)\s*$", street)
-        house = tail.group(1) if tail else ""
+    s = s.str.replace(GARBAGE_RE, " ", regex=True)
+    s = s.str.replace(r"\s+", " ", regex=True).str.strip()
 
-    return street, canon_house(house)
+    extracted = s.str.extract(FIN_ADDR_RE)
+    street_raw = extracted["street"].fillna("")
+    house_raw = extracted["house"].fillna("")
 
-def parse_addr_ap(addr):
-    """Адрес из файла 2: 'ул. Запарина; д.130' → ('запарина', '130')"""
-    if pd.isna(addr):
-        return "", ""
-    s = str(addr).lower().replace("ё", "е")
-    s = GARBAGE_RE.sub(" ", s)
+    # улица: последние 3 слова + убрать тип
+    street = street_raw.str.split().str[-3:].str.join(" ")
+    street = _clean_street(street)
+    house = _canon_house(house_raw)
 
-    house = ""
-    hm = DOM_RE.search(s)
-    if hm:
-        house = canon_house(hm.group(1))
-        s = s[: hm.start()]
-    else:
-        # fallback: последнее число в строке — это дом
-        tail = re.search(r"([0-9]+[0-9a-zA-Zа-яА-Я/]*)\s*$", s)
-        if tail:
-            house = canon_house(tail.group(1))
-            s = s[: tail.start()]
+    return street.fillna(""), house.fillna("")
 
-    s = re.sub(r"[;]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    street = clean_street_name(s)
-    return street, house
+def parse_ap_series(addr: pd.Series):
+    """Векторный парсинг адресов файла 2: 'ул. Запарина; д.130'."""
+    s = addr.astype(str).str.lower().str.replace("ё", "е", regex=False)
+    s = s.str.replace(GARBAGE_RE, " ", regex=True)
+
+    # дом по "д." или "дом"
+    extracted = s.str.extract(DOM_RE)
+    house_raw = extracted[0].fillna("")
+    has_dom = house_raw.ne("")
+    s_street = s.where(~has_dom, s.str.split(DOM_RE, n=1).str[0])
+
+    # fallback: если "д." нет — последнее число = дом
+    fallback = s_street.str.extract(r"([0-9]+[0-9a-zA-Zа-яА-Я/]*)\s*$")
+    fallback_house = fallback[0].fillna("")
+    need_fallback = (~has_dom) & fallback_house.ne("")
+    house_raw = house_raw.where(has_dom, fallback_house)
+    s_street = s_street.where(~need_fallback,
+                               s_street.str.replace(r"([0-9]+[0-9a-zA-Zа-яА-Я/]*)\s*$", "", regex=True))
+
+    s_street = s_street.str.replace(r"[;]+", " ", regex=True)
+    s_street = s_street.str.replace(r"\s+", " ", regex=True).str.strip()
+    street = _clean_street(s_street)
+    house = _canon_house(house_raw)
+    return street.fillna(""), house.fillna("")
+
+def to_float_series(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        s.astype(str).str.replace(",", ".", regex=False).str.replace(r"\s+", "", regex=True),
+        errors="coerce",
+    )
 
 # =========================================================
-# Геометрия
+# Haversine — numpy-версия
 # =========================================================
-def haversine_m(lat1, lon1, lat2, lon2):
-    if any(pd.isna(v) for v in (lat1, lon1, lat2, lon2)):
-        return np.inf
-    R = 6371000.0
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-    return 2 * R * asin(sqrt(a))
+R_EARTH = 6371000.0
 
-def to_float(x):
-    if pd.isna(x):
-        return np.nan
-    if isinstance(x, (int, float, np.integer, np.floating)):
-        return float(x)
-    s = str(x).strip().replace(",", ".")
-    s = re.sub(r"\s+", "", s)
-    try:
-        return float(s)
-    except ValueError:
-        return np.nan
+def haversine_np(lat1, lon1, lat2, lon2):
+    lat1 = np.radians(lat1); lon1 = np.radians(lon1)
+    lat2 = np.radians(lat2); lon2 = np.radians(lon2)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    return 2.0 * R_EARTH * np.arcsin(np.sqrt(a))
 
 # =========================================================
 # Загрузка
 # =========================================================
-def load_fin(uploaded):
-    df = pd.read_excel(uploaded)
+@st.cache_data(show_spinner=False)
+def load_fin(file_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_excel(io.BytesIO(file_bytes))
     df.columns = [c.strip() for c in df.columns]
-    df["Широта"] = df["Широта"].map(to_float)
-    df["Долгота"] = df["Долгота"].map(to_float)
-    df["_city_norm"] = df["город"].map(norm_city)
-    parsed = df.apply(lambda r: parse_addr_fin(r["Адрес"], r["_city_norm"]), axis=1)
-    df["_street"] = [p[0] for p in parsed]
-    df["_house"] = [p[1] for p in parsed]
+    df["Широта"] = to_float_series(df["Широта"])
+    df["Долгота"] = to_float_series(df["Долгота"])
+    df["_city_norm"] = norm_city_series(df["город"])
+    street, house = parse_fin_series(df["Адрес"], df["_city_norm"])
+    df["_street"] = street
+    df["_house"] = house
     return df
 
-def load_ap(uploaded):
-    df = pd.read_excel(uploaded)
+@st.cache_data(show_spinner=False)
+def load_ap(file_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_excel(io.BytesIO(file_bytes))
     df.columns = [c.strip() for c in df.columns]
-    df["Широта"] = df["Широта"].map(to_float)
-    df["Долгота"] = df["Долгота"].map(to_float)
-    df["_city_norm"] = df["город"].map(norm_city)
-    parsed = df["адрес"].map(parse_addr_ap)
-    df["_street"] = [p[0] for p in parsed]
-    df["_house"] = [p[1] for p in parsed]
+    df["Широта"] = to_float_series(df["Широта"])
+    df["Долгота"] = to_float_series(df["Долгота"])
+    df["_city_norm"] = norm_city_series(df["город"])
+    street, house = parse_ap_series(df["адрес"])
+    df["_street"] = street
+    df["_house"] = house
     return df
 
 # =========================================================
-# Сопоставление
+# Сопоставление — векторизованное
 # =========================================================
-def match(fin, ap, eps_m=EPS_M):
-    ap_valid = ap.dropna(subset=["Широта", "Долгота"]).reset_index(drop=True)
+@st.cache_data(show_spinner=False)
+def match(_fin: pd.DataFrame, _ap: pd.DataFrame, eps_m: float = EPS_M) -> pd.DataFrame:
+    fin = _fin.copy()
+    ap = _ap.dropna(subset=["Широта", "Долгота"]).reset_index(drop=True)
 
-    # группировка по городу
-    city_to_indices = {}
-    for i in range(len(ap_valid)):
-        city_to_indices.setdefault(ap_valid.at[i, "_city_norm"], []).append(i)
+    # ---------- Адресный канал через merge ----------
+    fin_key = fin.reset_index()[["index", "_city_norm", "_street", "_house"]].copy()
+    fin_key = fin_key[(fin_key["_street"] != "") & (fin_key["_house"] != "") & (fin_key["_city_norm"] != "")]
 
-    # кеш KDTree на город
-    city_trees = {}
-    def get_city_tree(city):
-        if city in city_trees:
-            return city_trees[city]
-        idxs = city_to_indices.get(city, [])
-        if not idxs:
-            city_trees[city] = (None, None)
-            return None, None
-        coords = ap_valid.loc[idxs, ["Широта", "Долгота"]].to_numpy()
-        tree = cKDTree(coords)
-        city_trees[city] = (tree, idxs)
-        return city_trees[city]
+    ap_key = ap[["_city_norm", "_street", "_house"]].copy()
+    ap_key["_ap_idx"] = np.arange(len(ap))
+    ap_key = ap_key[(ap_key["_street"] != "") & (ap_key["_house"] != "") & (ap_key["_city_norm"] != "")]
 
-    # результирующие колонки
+    cand = fin_key.merge(ap_key, on=["_city_norm", "_street", "_house"], how="inner")
+    # cand: index (фин), _ap_idx (ап)
+
+    addr_ok = pd.Series(False, index=fin.index)
+    addr_ap_idx = pd.Series(np.nan, index=fin.index)
+
+    if len(cand) > 0:
+        fin_lat = fin.loc[cand["index"], "Широта"].to_numpy()
+        fin_lon = fin.loc[cand["index"], "Долгота"].to_numpy()
+        ap_lat = ap.loc[cand["_ap_idx"], "Широта"].to_numpy()
+        ap_lon = ap.loc[cand["_ap_idx"], "Долгота"].to_numpy()
+        cand = cand.copy()
+        cand["_dist"] = haversine_np(fin_lat, fin_lon, ap_lat, ap_lon)
+        # оставляем ближайшего адресного кандидата на каждый фин-индекс
+        cand_best = cand.sort_values("_dist").drop_duplicates("index", keep="first")
+        addr_ok.loc[cand_best["index"]] = True
+        addr_ap_idx.loc[cand_best["index"]] = cand_best["_ap_idx"].values
+
+    # ---------- Гео-канал через KDTree батчем ----------
+    geo_ok = pd.Series(False, index=fin.index)
+    geo_ap_idx = pd.Series(np.nan, index=fin.index)
+    geo_dist_best = pd.Series(np.inf, index=fin.index)
+
+    fin_valid_mask = fin["Широта"].notna() & fin["Долгота"].notna() & (fin["_city_norm"] != "")
+
+    for city, fin_idx_city in fin[fin_valid_mask].groupby("_city_norm").groups.items():
+        ap_idx_city = ap.index[ap["_city_norm"] == city]
+        if len(ap_idx_city) == 0:
+            continue
+        ap_coords = ap.loc[ap_idx_city, ["Широта", "Долгота"]].to_numpy()
+        tree = cKDTree(ap_coords)
+
+        fin_idx_city = np.array(list(fin_idx_city))
+        fin_coords = fin.loc[fin_idx_city, ["Широта", "Долгота"]].to_numpy()
+
+        # радиус в градусах с учётом cos(lat)
+        cos_lat = np.cos(np.radians(fin_coords[:, 0]))
+        cos_lat = np.clip(cos_lat, 0.1, 1.0)
+        r_deg = (eps_m * 3.0) / 111320.0 / cos_lat  # массив радиусов
+
+        # query_ball_point не принимает массив r, поэтому берём максимальный
+        r_max = float(np.max(r_deg))
+        neighbours = tree.query_ball_point(fin_coords, r_max)
+
+        # собираем плоские пары (локальный индекс фин-точки, локальный индекс ап)
+        fin_local = []
+        ap_local = []
+        for i, lst in enumerate(neighbours):
+            if lst:
+                fin_local.extend([i] * len(lst))
+                ap_local.extend(lst)
+        if not fin_local:
+            continue
+
+        fin_local = np.array(fin_local)
+        ap_local = np.array(ap_local)
+
+        lat1 = fin_coords[fin_local, 0]
+        lon1 = fin_coords[fin_local, 1]
+        lat2 = ap_coords[ap_local, 0]
+        lon2 = ap_coords[ap_local, 1]
+
+        dist = haversine_np(lat1, lon1, lat2, lon2)
+        mask = dist <= eps_m
+        if not mask.any():
+            continue
+
+        fin_local = fin_local[mask]
+        ap_local = ap_local[mask]
+        dist = dist[mask]
+
+        # глобальные индексы
+        fin_global = fin_idx_city[fin_local]
+        ap_global = ap_idx_city[ap_local]
+
+        # оставляем ближайшего гео-соседа на каждый фин-индекс
+        tmp = pd.DataFrame({"fin": fin_global, "ap": ap_global, "d": dist})
+        tmp = tmp.sort_values("d").drop_duplicates("fin", keep="first")
+
+        geo_ok.loc[tmp["fin"].values] = True
+        geo_ap_idx.loc[tmp["fin"].values] = tmp["ap"].values
+        geo_dist_best.loc[tmp["fin"].values] = tmp["d"].values
+
+    # ---------- Сборка: приоритет вывода — адрес, иначе гео ----------
+    fin["Совпадение по адресу (ДА/НЕТ)"] = np.where(addr_ok, "ДА", "НЕТ")
+    fin["Совпадение по ГЕО (ДА/НЕТ)"] = np.where(geo_ok, "ДА", "НЕТ")
+
+    chosen_ap_idx = addr_ap_idx.where(addr_ok, geo_ap_idx)
+
     ap_out_cols = [
         "ID_Точки", "название", "адрес", "Широта", "Долгота",
         "Полигон", "город", "тип", "сеть", "база",
     ]
-    addr_flag = []
-    geo_flag = []
-    matched_ap = []  # список dict с полями АП или None
-
-    for _, r in fin.iterrows():
-        city = r["_city_norm"]
-        best_ap_idx = None
-
-        # --- канал "адрес" ---
-        addr_ap_idx = None
-        if city:
-            idxs = city_to_indices.get(city, [])
-            if r["_street"] and r["_house"]:
-                best_d = np.inf
-                for gi in idxs:
-                    a = ap_valid.loc[gi]
-                    if a["_street"] == r["_street"] and a["_house"] == r["_house"]:
-                        d = haversine_m(r["Широта"], r["Долгота"], a["Широта"], a["Долгота"])
-                        if d < best_d:
-                            best_d = d
-                            addr_ap_idx = gi
-        addr_ok = addr_ap_idx is not None
-
-        # --- канал "гео" ---
-        geo_ok = False
-        geo_ap_idx = None
-        if city:
-            tree, idxs = get_city_tree(city)
-            if tree is not None and not pd.isna(r["Широта"]) and not pd.isna(r["Долгота"]):
-                lat0 = r["Широта"]
-                cos_lat = cos(radians(lat0)) or 1.0
-                # радиус в градусах с запасом (учитываем долготу)
-                r_deg = (eps_m * 3.0) / 111320.0 / min(cos_lat, 1.0)
-                local_idxs = tree.query_ball_point([r["Широта"], r["Долгота"]], r_deg)
-                best_d = np.inf
-                for li in local_idxs:
-                    gi = idxs[li]
-                    a = ap_valid.loc[gi]
-                    d = haversine_m(lat0, r["Долгота"], a["Широта"], a["Долгота"])
-                    if d <= eps_m and d < best_d:
-                        best_d = d
-                        geo_ap_idx = gi
-                geo_ok = geo_ap_idx is not None
-
-        # приоритет вывода: адрес → гео
-        if addr_ok:
-            best_ap_idx = addr_ap_idx
-        elif geo_ok:
-            best_ap_idx = geo_ap_idx
-
-        addr_flag.append("ДА" if addr_ok else "НЕТ")
-        geo_flag.append("ДА" if geo_ok else "НЕТ")
-        matched_ap.append(ap_valid.loc[best_ap_idx].to_dict() if best_ap_idx is not None else None)
-
-    fin = fin.copy()
-    fin["Совпадение по адресу (ДА/НЕТ)"] = addr_flag
-    fin["Совпадение по ГЕО (ДА/НЕТ)"] = geo_flag
+    # все выбранные ап-индексы
+    chosen_valid = chosen_ap_idx.dropna()
+    ap_lookup = ap.loc[chosen_valid.astype(int).values, ap_out_cols].copy()
+    ap_lookup.index = chosen_valid.index
 
     for c in ap_out_cols:
-        fin[c + "_ap"] = [m.get(c) if m else None for m in matched_ap]
+        fin[c + "_ap"] = ap_lookup[c].reindex(fin.index)
 
     return fin
 
@@ -300,16 +312,18 @@ with col2:
     file_ap = st.file_uploader("Файл 2: возможная АП (.xlsx)", type=["xlsx"], key="ap")
 
 if file_fin and file_ap:
+    fin_bytes = file_fin.getvalue()
+    ap_bytes = file_ap.getvalue()
+
     with st.spinner("Читаем файлы..."):
-        fin = load_fin(file_fin)
-        ap = load_ap(file_ap)
+        fin = load_fin(fin_bytes)
+        ap = load_ap(ap_bytes)
 
     st.write(f"Фин ап: {len(fin)} строк. Возможная АП: {len(ap)} строк.")
 
     with st.spinner("Сопоставляем..."):
-        result = match(fin, ap)
+        result = match(fin, ap, EPS_M)
 
-    # финальная сборка строго в заданном порядке
     result_out = result[[
         "ТЕРРИТОРИЯ", "КЛАСТЕР", "ИМЯ МАГАЗИНА", "SAP НОМЕР МАГАЗИНА",
         "АК наименование", "УА ПЛАНОГРАММЫ", "СТАТУС МАГАЗИНА", "Адрес",
@@ -330,7 +344,9 @@ if file_fin and file_ap:
         "база_ap": "база",
     })
 
-    # выгрузка в Excel
+    # защита от дублей колонок — на всякий случай
+    assert result_out.columns.is_unique, f"Duplicate columns: {list(result_out.columns)}"
+
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
         result_out.to_excel(w, index=False, sheet_name="Результат")
@@ -352,18 +368,14 @@ if file_fin and file_ap:
                 "Не найдено",
             ],
             "Значение": [
-                len(result_out),
-                addr_da,
-                geo_da,
-                any_da,
-                len(result_out) - any_da,
+                len(result_out), addr_da, geo_da, any_da, len(result_out) - any_da,
             ],
         })
         metrics.to_excel(w, index=False, sheet_name="Метрики")
     bio.seek(0)
 
     st.success("Готово.")
-    st.dataframe(result_out.head(50), use_container_width=True)
+    st.dataframe(result_out.head(50), width="stretch")
     st.download_button(
         label="Скачать результат (.xlsx)",
         data=bio,
