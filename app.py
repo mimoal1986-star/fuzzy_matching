@@ -30,7 +30,7 @@ with st.sidebar:
     )
 
 st.caption(
-    f"Приоритет 1 — совпадение адреса. "
+    f"Приоритет 1 — совпадение адреса (4 канала). "
     f"Приоритет 2 — координаты ≤ {EPS_M:.0f} м (жёстко). "
     f"Приоритет 3 — топ ближайших пар, добиваем до {n_target}. "
     f"Достигли {n_target} — стоп."
@@ -386,13 +386,13 @@ def _prepare_keys(df: pd.DataFrame) -> pd.DataFrame:
 
 # =========================================================
 # Основной подбор
-#   П1 = адрес
+#   П1 = адрес (4 канала)
 #   П2 = координаты ≤ EPS_M (15 м)
 #   П3 = топ ближайших пар (без порога)
 #   Лимит X: П1 → П2 → П3 (П3 — ровно до остатка X)
 # =========================================================
 @st.cache_data(show_spinner=False)
-def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int) -> pd.DataFrame:
+def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
     fin = fin.reset_index(drop=True).copy()
     ap = ap.reset_index(drop=True).copy()
 
@@ -400,7 +400,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int) -> pd.DataFrame:
     ap_work = ap[ap_valid].reset_index(drop=True).copy()
     n_ap = len(ap_work)
     if n_ap == 0:
-        return pd.DataFrame()
+        return pd.DataFrame(), np.zeros(0, dtype=int)
 
     fin_has_coords = (fin["Широта"].notna() & fin["Долгота"].notna()).to_numpy()
     fin_lat_all = fin["Широта"].to_numpy()
@@ -409,19 +409,21 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int) -> pd.DataFrame:
     ap_lon_all = ap_work["Долгота"].to_numpy()
 
     fin_key = _prepare_keys(fin)
+    # FIX: ap_key должен иметь _ap_idx, а не _row
     ap_key = _prepare_keys(ap_work).rename(columns={"_row": "_ap_idx"})
 
     # результаты по индексу ap_work (0..n_ap-1)
     addr_ok = np.zeros(n_ap, dtype=bool)
     addr_fin = np.full(n_ap, -1, dtype=int)
     addr_dist = np.full(n_ap, np.nan)
+    addr_channel = np.zeros(n_ap, dtype=int)   # 0 = не сработал, 1..4 = номер канала
 
     geo_ok = np.zeros(n_ap, dtype=bool)
     geo_fin = np.full(n_ap, -1, dtype=int)
     geo_dist = np.full(n_ap, np.nan)
 
     # ---------- Приоритет 1: адресные каналы ----------
-    def _apply_channel(cand: pd.DataFrame):
+    def _apply_channel(cand: pd.DataFrame, channel_no: int):
         if len(cand) == 0:
             return
         cand = cand[~addr_ok[cand["_ap_idx"].to_numpy()]]
@@ -446,13 +448,14 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int) -> pd.DataFrame:
         addr_ok[b_a] = True
         addr_fin[b_a] = best["_row"].to_numpy()
         addr_dist[b_a] = best["_dist"].to_numpy()
+        addr_channel[b_a] = channel_no
 
     # канал 1: (город, улица, дом)
-    _apply_channel(fin_key.merge(ap_key, on=["_city_norm", "_street", "_house"], how="inner"))
+    _apply_channel(fin_key.merge(ap_key, on=["_city_norm", "_street", "_house"], how="inner"), 1)
     # канал 2: (город, улица, дом_база)
-    _apply_channel(fin_key.merge(ap_key, on=["_city_norm", "_street", "_house_base"], how="inner"))
+    _apply_channel(fin_key.merge(ap_key, on=["_city_norm", "_street", "_house_base"], how="inner"), 2)
     # канал 3: (город, улица_3слова, дом_база)
-    _apply_channel(fin_key.merge(ap_key, on=["_city_norm", "_street3", "_house_base"], how="inner"))
+    _apply_channel(fin_key.merge(ap_key, on=["_city_norm", "_street3", "_house_base"], how="inner"), 3)
     # канал 4: (город, дом_база) при уникальной улице в обеих таблицах
     ap_uniq = (ap_key.groupby(["_city_norm", "_house_base"])["_street"]
                .nunique().reset_index().rename(columns={"_street": "_ap_nuniq"}))
@@ -469,7 +472,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int) -> pd.DataFrame:
                                    how="inner", suffixes=("_f", "_a"))
         cand4 = cand4[cand4["_house_f"] == cand4["_house_a"]]
         if len(cand4) > 0:
-            _apply_channel(cand4[["_row", "_ap_idx"]])
+            _apply_channel(cand4[["_row", "_ap_idx"]], 4)
 
     # ---------- Приоритет 2: координаты ≤ EPS_M ----------
     ap_need_geo = ap_work[~addr_ok]
@@ -537,7 +540,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int) -> pd.DataFrame:
             tree = cKDTree(fin_coords)
             ap_coords = np.column_stack([ap_lat_all[ap_idx_city],
                                           ap_lon_all[ap_idx_city]])
-            d, idx = tree.query(ap_coords, k=1)   # ближайший, без порога
+            d, idx = tree.query(ap_coords, k=1)
             a = ap_idx_city
             prio3_ok[a] = True
             prio3_fin[a] = fin_idx_city[idx]
@@ -546,7 +549,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int) -> pd.DataFrame:
     # ---------- Лимит X: П1 → П2 → П3 ----------
     taken = np.zeros(n_ap, dtype=bool)
 
-    # П1: NaN-расстояния гарантированно в конец
     p1_idx = np.flatnonzero(addr_ok)
     if len(p1_idx) > 0:
         d1 = addr_dist[p1_idx]
@@ -588,6 +590,12 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int) -> pd.DataFrame:
     out["Приоритет 2 (ДА/НЕТ)"] = np.where(~addr_ok & geo_ok, "ДА", "НЕТ")
     out["Приоритет 3 (ДА/НЕТ)"] = np.where(~addr_ok & ~geo_ok & prio3_ok, "ДА", "НЕТ")
 
+    out["Канал адреса"] = np.where(addr_ok, addr_channel, 0).astype(int)
+
+    # диагностика: как распарсились адреса у выбранной пары
+    out["Улица_norm_АП"] = ap_work["_street"].to_numpy()
+    out["Дом_norm_АП"] = ap_work["_house"].to_numpy()
+
     chosen_fin = np.where(addr_ok, addr_fin,
                   np.where(geo_ok, geo_fin, prio3_fin))
     chosen_dist = np.where(addr_ok, addr_dist,
@@ -599,7 +607,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int) -> pd.DataFrame:
     out["_prio_num"] = np.where(addr_ok, 1, np.where(geo_ok, 2,
                        np.where(prio3_ok, 3, 4)))
 
-    # сначала отсекаем по taken — мержим фин-поля только для взятых
     out = out[out["_taken"]].copy()
 
     fin_out_cols = ["ТЕРРИТОРИЯ", "КЛАСТЕР", "ИМЯ МАГАЗИНА", "SAP НОМЕР МАГАЗИНА",
@@ -613,12 +620,23 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int) -> pd.DataFrame:
         fin_lookup.index = out.index
         for c in fin_cols_present:
             out[c] = fin_lookup[c]
+        # диагностика улицы/дома фин-апа
+        fin_diag = fin.loc[chosen_vals, ["_street", "_house"]].copy()
+        fin_diag.index = out.index
+        out["Улица_norm_фин"] = fin_diag["_street"]
+        out["Дом_norm_фин"] = fin_diag["_house"]
+    else:
+        out["Улица_norm_фин"] = np.nan
+        out["Дом_norm_фин"] = np.nan
+
     for c in fin_out_cols:
         if c not in out.columns:
             out[c] = np.nan
 
     out = out.sort_values(["_prio_num", "Расстояние по гео"], na_position="last")
-    return out
+
+    # диагностический массив: channel по ap_work (для diag листа)
+    return out, addr_channel
 
 # =========================================================
 # UI
@@ -640,7 +658,7 @@ if file_fin and file_ap:
     st.write(f"Фин ап: {len(fin)} строк. Возможная АП: {len(ap)} строк.")
 
     with st.spinner("Подбираем..."):
-        result = match(fin, ap, int(n_target))
+        result, _channel_by_ap = match(fin, ap, int(n_target))
 
     if result.empty:
         st.warning("Не удалось подобрать ни одной АП (нет координат / городов / магазинов).")
@@ -663,7 +681,12 @@ if file_fin and file_ap:
         "Приоритет 1 (ДА/НЕТ)": result["Приоритет 1 (ДА/НЕТ)"],
         "Приоритет 2 (ДА/НЕТ)": result["Приоритет 2 (ДА/НЕТ)"],
         "Приоритет 3 (ДА/НЕТ)": result["Приоритет 3 (ДА/НЕТ)"],
+        "Канал адреса": result["Канал адреса"],
         "Расстояние по гео": result["Расстояние по гео"],
+        "Улица_norm_АП": result["Улица_norm_АП"],
+        "Дом_norm_АП": result["Дом_norm_АП"],
+        "Улица_norm_фин": result["Улица_norm_фин"],
+        "Дом_norm_фин": result["Дом_norm_фин"],
         "ТЕРРИТОРИЯ": result["ТЕРРИТОРИЯ"],
         "КЛАСТЕР": result["КЛАСТЕР"],
         "ИМЯ МАГАЗИНА": result["ИМЯ МАГАЗИНА"],
@@ -680,17 +703,54 @@ if file_fin and file_ap:
     st.success(f"Подобрано {len(final)} из {n_target} (цель). Достигли X — стоп.")
     st.dataframe(final.head(50), use_container_width=True)
 
+    # диагностические таблицы
+    diag_fin = fin[["Адрес", "город", "_city_norm", "_street", "_house"]].copy()
+    diag_fin["_house_base"] = _house_base(diag_fin["_house"])
+    diag_fin["_street3"] = _street_first_n(diag_fin["_street"], 3)
+    diag_fin = diag_fin.rename(columns={
+        "_city_norm": "город_norm",
+        "_street": "улица_norm",
+        "_house": "дом_norm",
+        "_house_base": "дом_база",
+        "_street3": "улица_3слова",
+    })
+
+    diag_ap = ap[["ID_Точки", "адрес", "город", "_city_norm", "_street", "_house"]].copy()
+    diag_ap["_house_base"] = _house_base(diag_ap["_house"])
+    diag_ap["_street3"] = _street_first_n(diag_ap["_street"], 3)
+    diag_ap = diag_ap.rename(columns={
+        "_city_norm": "город_norm",
+        "_street": "улица_norm",
+        "_house": "дом_norm",
+        "_house_base": "дом_база",
+        "_street3": "улица_3слова",
+    })
+
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
         final.to_excel(w, index=False, sheet_name="Результат")
+        diag_fin.to_excel(w, index=False, sheet_name="Разбор_фин")
+        diag_ap.to_excel(w, index=False, sheet_name="Разбор_АП")
+
         p1 = int((final["Приоритет 1 (ДА/НЕТ)"] == "ДА").sum())
         p2 = int((final["Приоритет 2 (ДА/НЕТ)"] == "ДА").sum())
         p3 = int((final["Приоритет 3 (ДА/НЕТ)"] == "ДА").sum())
+        # разбивка П1 по каналам
+        ch_counts = final.loc[final["Приоритет 1 (ДА/НЕТ)"] == "ДА", "Канал адреса"]
+        ch1 = int((ch_counts == 1).sum())
+        ch2 = int((ch_counts == 2).sum())
+        ch3 = int((ch_counts == 3).sum())
+        ch4 = int((ch_counts == 4).sum())
+
         metrics = pd.DataFrame({
             "Показатель": [
                 "Цель X",
                 "Подобрано всего",
-                "Приоритет 1 (адрес)",
+                "Приоритет 1 (адрес), всего",
+                "  канал 1: (город, улица, дом)",
+                "  канал 2: (город, улица, дом_база)",
+                "  канал 3: (город, улица_3слова, дом_база)",
+                "  канал 4: (город, дом_база, уник. улица)",
                 f"Приоритет 2 (координаты ≤ {EPS_M:.0f} м)",
                 "Приоритет 3 (ближайшие, добивка)",
                 "Осталось до X (не хватило АП)",
@@ -698,7 +758,8 @@ if file_fin and file_ap:
             "Значение": [
                 int(n_target),
                 len(final),
-                p1, p2, p3,
+                p1, ch1, ch2, ch3, ch4,
+                p2, p3,
                 max(0, int(n_target) - len(final)),
             ],
         })
