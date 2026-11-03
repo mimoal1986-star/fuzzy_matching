@@ -732,7 +732,7 @@ if file_fin and file_ap:
         p2 = int((final["Приоритет 2 (ДА/НЕТ)"] == "ДА").sum())
         p3 = int((final["Приоритет 3 (ДА/НЕТ)"] == "ДА").sum())
         # разбивка П1 по каналам
-        ch_counts = final.loc[final["Приоритет 1 (ДА/НЕТ)"] == "ДА", "Канал адреса"]
+        ch_counts = result.loc[result["Приоритет 1 (ДА/НЕТ)"] == "ДА", "Канал адреса"]
         ch1 = int((ch_counts == 1).sum())
         ch2 = int((ch_counts == 2).sum())
         ch3 = int((ch_counts == 3).sum())
