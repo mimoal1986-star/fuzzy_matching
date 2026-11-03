@@ -409,7 +409,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int) -> pd.DataFrame:
     ap_lon_all = ap_work["Долгота"].to_numpy()
 
     fin_key = _prepare_keys(fin)
-    ap_key = _prepare_keys(ap_work)
+    ap_key = _prepare_keys(ap_work).rename(columns={"_row": "_ap_idx"})
 
     # результаты по индексу ap_work (0..n_ap-1)
     addr_ok = np.zeros(n_ap, dtype=bool)
