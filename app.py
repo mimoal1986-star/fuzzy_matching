@@ -16,7 +16,7 @@ st.title("Подбор ближайшего магазина фин-ап к во
 # =========================================================
 # Жёсткий порог для Приоритета 2 (координаты)
 # =========================================================
-EPS_M = 15.0  # FIX п.3: жёстко 15 м для П2
+EPS_M = 15.0  # Приоритет 2: координаты ≤ 15 м, жёстко
 
 # =========================================================
 # Сайдбар
@@ -28,17 +28,12 @@ with st.sidebar:
         min_value=1, max_value=100_000, value=2350, step=50,
         help="Набрали X подборов — калькулятор останавливается.",
     )
-    max_prio3_km = st.slider(
-        "Макс. расстояние для Приоритета 3, км",
-        min_value=0, max_value=500, value=100, step=10,
-        help="0 = без ограничения. Защита от мусора при ошибках геокодирования.",
-    )
 
 st.caption(
     f"Приоритет 1 — совпадение адреса. "
     f"Приоритет 2 — координаты ≤ {EPS_M:.0f} м (жёстко). "
-    f"Приоритет 3 — ближайшие пары, добиваем до {n_target}."
-    + (f" Порог П3: ≤ {max_prio3_km} км." if max_prio3_km > 0 else " Порог П3: без ограничения.")
+    f"Приоритет 3 — топ ближайших пар, добиваем до {n_target}. "
+    f"Достигли {n_target} — стоп."
 )
 
 # =========================================================
@@ -393,12 +388,11 @@ def _prepare_keys(df: pd.DataFrame) -> pd.DataFrame:
 # Основной подбор
 #   П1 = адрес
 #   П2 = координаты ≤ EPS_M (15 м)
-#   П3 = ближайший оставшийся (с опц. порогом max_prio3_km)
+#   П3 = топ ближайших пар (без порога)
 #   Лимит X: П1 → П2 → П3 (П3 — ровно до остатка X)
 # =========================================================
 @st.cache_data(show_spinner=False)
-def match(fin: pd.DataFrame, ap: pd.DataFrame,
-          n_target: int, max_prio3_km: float) -> pd.DataFrame:
+def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int) -> pd.DataFrame:
     fin = fin.reset_index(drop=True).copy()
     ap = ap.reset_index(drop=True).copy()
 
@@ -478,11 +472,10 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame,
             _apply_channel(cand4[["_row", "_ap_idx"]])
 
     # ---------- Приоритет 2: координаты ≤ EPS_M ----------
-    # FIX п.11: итерируем только по непокрытым П1 АП (экономия KDTree/запросов)
     ap_need_geo = ap_work[~addr_ok]
     if len(ap_need_geo) > 0:
         for city, ap_idx_city in ap_need_geo.groupby("_city_norm").groups.items():
-            ap_idx_city = np.asarray(ap_idx_city)  # позиции в ap_work (RangeIndex)
+            ap_idx_city = np.asarray(ap_idx_city)
             fin_idx_city = np.flatnonzero(
                 fin_has_coords & (fin["_city_norm"].to_numpy() == city)
             )
@@ -525,14 +518,12 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame,
             geo_fin[a] = tmp["fin"].to_numpy()
             geo_dist[a] = tmp["d"].to_numpy()
 
-    # ---------- Приоритет 3: ближайший оставшийся ----------
+    # ---------- Приоритет 3: топ ближайших пар, без порога ----------
     prio3_ok = np.zeros(n_ap, dtype=bool)
     prio3_fin = np.full(n_ap, -1, dtype=int)
     prio3_dist = np.full(n_ap, np.nan)
 
     need_p3 = ~(addr_ok | geo_ok)
-    max_prio3_m = (max_prio3_km * 1000.0) if max_prio3_km and max_prio3_km > 0 else None
-
     if need_p3.any():
         for city, ap_idx_city in ap_work[need_p3].groupby("_city_norm").groups.items():
             ap_idx_city = np.asarray(ap_idx_city)
@@ -546,25 +537,16 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame,
             tree = cKDTree(fin_coords)
             ap_coords = np.column_stack([ap_lat_all[ap_idx_city],
                                           ap_lon_all[ap_idx_city]])
-            d, idx = tree.query(ap_coords, k=1)
-            if max_prio3_m is not None:
-                within = d <= max_prio3_m
-                if not within.any():
-                    continue
-                a = ap_idx_city[within]
-                prio3_ok[a] = True
-                prio3_fin[a] = fin_idx_city[idx[within]]
-                prio3_dist[a] = d[within]
-            else:
-                a = ap_idx_city
-                prio3_ok[a] = True
-                prio3_fin[a] = fin_idx_city[idx]
-                prio3_dist[a] = d
+            d, idx = tree.query(ap_coords, k=1)   # ближайший, без порога
+            a = ap_idx_city
+            prio3_ok[a] = True
+            prio3_fin[a] = fin_idx_city[idx]
+            prio3_dist[a] = d
 
     # ---------- Лимит X: П1 → П2 → П3 ----------
     taken = np.zeros(n_ap, dtype=bool)
 
-    # FIX п.3/п.12: NaN в П1 гарантированно уходит в конец (inf-замена), stable sort
+    # П1: NaN-расстояния гарантированно в конец
     p1_idx = np.flatnonzero(addr_ok)
     if len(p1_idx) > 0:
         d1 = addr_dist[p1_idx]
@@ -617,7 +599,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame,
     out["_prio_num"] = np.where(addr_ok, 1, np.where(geo_ok, 2,
                        np.where(prio3_ok, 3, 4)))
 
-    # FIX п.16: сначала отсекаем по taken, потом мержим фин-поля — меньше работы
+    # сначала отсекаем по taken — мержим фин-поля только для взятых
     out = out[out["_taken"]].copy()
 
     fin_out_cols = ["ТЕРРИТОРИЯ", "КЛАСТЕР", "ИМЯ МАГАЗИНА", "SAP НОМЕР МАГАЗИНА",
@@ -658,7 +640,7 @@ if file_fin and file_ap:
     st.write(f"Фин ап: {len(fin)} строк. Возможная АП: {len(ap)} строк.")
 
     with st.spinner("Подбираем..."):
-        result = match(fin, ap, int(n_target), float(max_prio3_km))
+        result = match(fin, ap, int(n_target))
 
     if result.empty:
         st.warning("Не удалось подобрать ни одной АП (нет координат / городов / магазинов).")
