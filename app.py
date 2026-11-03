@@ -540,11 +540,17 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
             tree = cKDTree(fin_coords)
             ap_coords = np.column_stack([ap_lat_all[ap_idx_city],
                                           ap_lon_all[ap_idx_city]])
-            d, idx = tree.query(ap_coords, k=1)
+
+            d_deg, idx = tree.query(ap_coords, k=1)   # градусы — только для выбора
+            # П3: расстояние в МЕТРАХ через haversine (как в П1/П2)
+            d_m = haversine_np(
+                ap_coords[:, 0], ap_coords[:, 1],
+                fin_coords[idx, 0], fin_coords[idx, 1],
+            )
             a = ap_idx_city
             prio3_ok[a] = True
             prio3_fin[a] = fin_idx_city[idx]
-            prio3_dist[a] = d
+            prio3_dist[a] = d_m
 
     # ---------- Лимит X: П1 → П2 → П3 ----------
     taken = np.zeros(n_ap, dtype=bool)
@@ -592,7 +598,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
 
     out["Канал адреса"] = np.where(addr_ok, addr_channel, 0).astype(int)
 
-    # диагностика: как распарсились адреса у выбранной пары
     out["Улица_norm_АП"] = ap_work["_street"].to_numpy()
     out["Дом_norm_АП"] = ap_work["_house"].to_numpy()
 
@@ -600,7 +605,8 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
                   np.where(geo_ok, geo_fin, prio3_fin))
     chosen_dist = np.where(addr_ok, addr_dist,
                    np.where(geo_ok, geo_dist, prio3_dist))
-    out["Расстояние по гео"] = chosen_dist
+    # FIX: колонка в МЕТРАХ, имя с явной единицей
+    out["Расстояние по гео,м"] = chosen_dist
 
     out["_chosen_fin"] = chosen_fin
     out["_taken"] = taken
@@ -620,7 +626,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
         fin_lookup.index = out.index
         for c in fin_cols_present:
             out[c] = fin_lookup[c]
-        # диагностика улицы/дома фин-апа
         fin_diag = fin.loc[chosen_vals, ["_street", "_house"]].copy()
         fin_diag.index = out.index
         out["Улица_norm_фин"] = fin_diag["_street"]
@@ -633,9 +638,9 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
         if c not in out.columns:
             out[c] = np.nan
 
-    out = out.sort_values(["_prio_num", "Расстояние по гео"], na_position="last")
+    # FIX: сортировка по переименованной колонке
+    out = out.sort_values(["_prio_num", "Расстояние по гео,м"], na_position="last")
 
-    # диагностический массив: channel по ap_work (для diag листа)
     return out, addr_channel
 
 # =========================================================
@@ -682,7 +687,7 @@ if file_fin and file_ap:
         "Приоритет 2 (ДА/НЕТ)": result["Приоритет 2 (ДА/НЕТ)"],
         "Приоритет 3 (ДА/НЕТ)": result["Приоритет 3 (ДА/НЕТ)"],
         "Канал адреса": result["Канал адреса"],
-        "Расстояние по гео": result["Расстояние по гео"],
+        "Расстояние по гео,м": result["Расстояние по гео,м"],
         "Улица_norm_АП": result["Улица_norm_АП"],
         "Дом_norm_АП": result["Дом_norm_АП"],
         "Улица_norm_фин": result["Улица_norm_фин"],
