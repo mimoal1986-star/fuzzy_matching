@@ -7,30 +7,38 @@ import pandas as pd
 import streamlit as st
 from scipy.spatial import cKDTree
 
-st.set_page_config(page_title="Подбор ближайшего магазина фин-ап к возможной АП", layout="wide")
+st.set_page_config(
+    page_title="Подбор ближайшего магазина фин-ап к возможной АП",
+    layout="wide",
+)
 st.title("Подбор ближайшего магазина фин-ап к возможной АП")
 
 # =========================================================
-# Сайдбар — настройки (FIX: n_target и пороги)
+# Жёсткий порог для Приоритета 2 (координаты)
+# =========================================================
+EPS_M = 15.0  # FIX п.3: жёстко 15 м для П2
+
+# =========================================================
+# Сайдбар
 # =========================================================
 with st.sidebar:
     st.header("Настройки")
     n_target = st.number_input(
-        "Кол-во подборов", min_value=1, max_value=100_000, value=2350, step=50,
-        help="Сколько возможных АП нужно закрыть подборами. Как только набрано — упражнение выполнено.",
+        "Кол-во подборов (X)",
+        min_value=1, max_value=100_000, value=2350, step=50,
+        help="Набрали X подборов — калькулятор останавливается.",
     )
-    eps_m = st.slider(
-        "Порог гео для Приоритета 1, м", min_value=15, max_value=1000, value=150, step=5,
-        help="Если координаты АП и фин-апа в пределах этого порога — это Приоритет 1.",
-    )
-    max_prio2_km = st.slider(
-        "Макс. расстояние для Приоритета 2, км", min_value=1, max_value=100, value=10, step=1,
-        help="Если ближайший магазин дальше — подбор не засчитывается (защита от мусора).",
+    max_prio3_km = st.slider(
+        "Макс. расстояние для Приоритета 3, км",
+        min_value=0, max_value=500, value=100, step=10,
+        help="0 = без ограничения. Защита от мусора при ошибках геокодирования.",
     )
 
 st.caption(
-    f"Приоритет 1: адрес ИЛИ координаты ≤ {eps_m} м. "
-    f"Приоритет 2: ближайший магазин того же города, но не дальше {max_prio2_km} км."
+    f"Приоритет 1 — совпадение адреса. "
+    f"Приоритет 2 — координаты ≤ {EPS_M:.0f} м (жёстко). "
+    f"Приоритет 3 — ближайшие пары, добиваем до {n_target}."
+    + (f" Порог П3: ≤ {max_prio3_km} км." if max_prio3_km > 0 else " Порог П3: без ограничения.")
 )
 
 # =========================================================
@@ -326,23 +334,25 @@ def haversine_np(lat1, lon1, lat2, lon2):
     return 2.0 * R_EARTH * np.arcsin(np.sqrt(a))
 
 # =========================================================
-# Загрузка (FIX: проверка обязательных колонок)
+# Загрузка
 # =========================================================
 FIN_REQUIRED = ["Адрес", "город", "Широта", "Долгота"]
 AP_REQUIRED = ["ID_Точки", "название", "адрес", "Широта", "Долгота", "город"]
 
-def _check_cols(df: pd.DataFrame, required: list[str], name: str):
+def _check_cols(df: pd.DataFrame, required: list, name: str):
     missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(f"В файле «{name}» нет обязательных колонок: {missing}. "
-                         f"Есть: {list(df.columns)}")
+        raise ValueError(
+            f"В файле «{name}» нет обязательных колонок: {missing}. "
+            f"Есть: {list(df.columns)}"
+        )
 
 @st.cache_data(show_spinner=False)
 def load_fin(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_excel(io.BytesIO(file_bytes))
     df.columns = [c.strip() for c in df.columns]
     _check_cols(df, FIN_REQUIRED, "фин ап")
-    df = df.reset_index(drop=True)  # FIX: явный RangeIndex
+    df = df.reset_index(drop=True)
     df["Широта"] = to_float_series(df["Широта"])
     df["Долгота"] = to_float_series(df["Долгота"])
     df["_city_norm"] = norm_city_series(df["город"])
@@ -356,7 +366,7 @@ def load_ap(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_excel(io.BytesIO(file_bytes))
     df.columns = [c.strip() for c in df.columns]
     _check_cols(df, AP_REQUIRED, "возможная АП")
-    df = df.reset_index(drop=True)  # FIX: явный RangeIndex
+    df = df.reset_index(drop=True)
     df["Широта"] = to_float_series(df["Широта"])
     df["Долгота"] = to_float_series(df["Долгота"])
     df["_city_norm"] = norm_city_series(df["город"])
@@ -380,12 +390,15 @@ def _prepare_keys(df: pd.DataFrame) -> pd.DataFrame:
     return key
 
 # =========================================================
-# FIX: основной матч — итерируем по АП, ищем ближайший фин-ап
+# Основной подбор
+#   П1 = адрес
+#   П2 = координаты ≤ EPS_M (15 м)
+#   П3 = ближайший оставшийся (с опц. порогом max_prio3_km)
+#   Лимит X: П1 → П2 → П3 (П3 — ровно до остатка X)
 # =========================================================
 @st.cache_data(show_spinner=False)
-def match(fin: pd.DataFrame, ap: pd.DataFrame, eps_m: float,
-          max_prio2_km: float, n_target: int) -> pd.DataFrame:
-    # FIX: явные RangeIndex — _row/_ap_idx позиционные и совпадают с label
+def match(fin: pd.DataFrame, ap: pd.DataFrame,
+          n_target: int, max_prio3_km: float) -> pd.DataFrame:
     fin = fin.reset_index(drop=True).copy()
     ap = ap.reset_index(drop=True).copy()
 
@@ -395,36 +408,26 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, eps_m: float,
     if n_ap == 0:
         return pd.DataFrame()
 
-    fin_valid = fin["Широта"].notna() & fin["Долгота"].notna()
-    fin_work = fin  # координаты проверяем по месту, но нужны для гео-каналов
-
-    # ключи
-    fin_key = _prepare_keys(fin)
-    ap_key = _prepare_keys(ap_work)
-
+    fin_has_coords = (fin["Широта"].notna() & fin["Долгота"].notna()).to_numpy()
     fin_lat_all = fin["Широта"].to_numpy()
     fin_lon_all = fin["Долгота"].to_numpy()
-    fin_has_coords = fin_valid.to_numpy()
-
     ap_lat_all = ap_work["Широта"].to_numpy()
     ap_lon_all = ap_work["Долгота"].to_numpy()
 
+    fin_key = _prepare_keys(fin)
+    ap_key = _prepare_keys(ap_work)
+
     # результаты по индексу ap_work (0..n_ap-1)
     addr_ok = np.zeros(n_ap, dtype=bool)
-    addr_fin = np.full(n_ap, -1, dtype=int)       # позиция в fin
+    addr_fin = np.full(n_ap, -1, dtype=int)
     addr_dist = np.full(n_ap, np.nan)
 
     geo_ok = np.zeros(n_ap, dtype=bool)
     geo_fin = np.full(n_ap, -1, dtype=int)
     geo_dist = np.full(n_ap, np.nan)
 
-    # ---------- Приоритет 1a: адресные каналы ----------
+    # ---------- Приоритет 1: адресные каналы ----------
     def _apply_channel(cand: pd.DataFrame):
-        """cand: _row (позиция в fin) + _ap_idx (позиция в ap_work).
-        FIX: для адреса не требуем координат у фин-апа.
-        Если координат нет — расстояние NaN, но совпадение засчитывается.
-        Если несколько кандидатов — берём ближайшего; без координат — первого.
-        """
         if len(cand) == 0:
             return
         cand = cand[~addr_ok[cand["_ap_idx"].to_numpy()]]
@@ -433,8 +436,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, eps_m: float,
         f_rows = cand["_row"].to_numpy()
         a_rows = cand["_ap_idx"].to_numpy()
 
-        # расстояние считаем только там, где есть координаты у обоих
-        both = fin_has_coords[f_rows]  # у АП координаты уже гарантированы
+        both = fin_has_coords[f_rows]
         d = np.full(len(cand), np.nan)
         if both.any():
             d[both] = haversine_np(
@@ -442,7 +444,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, eps_m: float,
                 ap_lat_all[a_rows[both]], ap_lon_all[a_rows[both]],
             )
         cand = cand.assign(_dist=d)
-        # NaN-расстояния уходят в конец, чтобы валидные координаты имели приоритет
         best = (
             cand.sort_values("_dist", na_position="last")
                 .drop_duplicates("_ap_idx", keep="first")
@@ -452,13 +453,13 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, eps_m: float,
         addr_fin[b_a] = best["_row"].to_numpy()
         addr_dist[b_a] = best["_dist"].to_numpy()
 
-    # Канал 1 — точное (city, street, house)
+    # канал 1: (город, улица, дом)
     _apply_channel(fin_key.merge(ap_key, on=["_city_norm", "_street", "_house"], how="inner"))
-    # Канал 2 — (city, street, house_base)
+    # канал 2: (город, улица, дом_база)
     _apply_channel(fin_key.merge(ap_key, on=["_city_norm", "_street", "_house_base"], how="inner"))
-    # Канал 3 — (city, street3, house_base)
+    # канал 3: (город, улица_3слова, дом_база)
     _apply_channel(fin_key.merge(ap_key, on=["_city_norm", "_street3", "_house_base"], how="inner"))
-    # Канал 4 — (city, house_base) при уникальной улице в обеих
+    # канал 4: (город, дом_база) при уникальной улице в обеих таблицах
     ap_uniq = (ap_key.groupby(["_city_norm", "_house_base"])["_street"]
                .nunique().reset_index().rename(columns={"_street": "_ap_nuniq"}))
     fin_uniq = (fin_key.groupby(["_city_norm", "_house_base"])["_street"]
@@ -476,87 +477,120 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, eps_m: float,
         if len(cand4) > 0:
             _apply_channel(cand4[["_row", "_ap_idx"]])
 
-    # ---------- Приоритет 1b: координаты ≤ eps_m ----------
-    for city, ap_idx_city in ap_work.groupby("_city_norm").groups.items():
-        ap_idx_city = np.asarray(ap_idx_city)  # FIX: позиции (RangeIndex)
-        fin_idx_city = np.flatnonzero(
-            fin_has_coords & (fin["_city_norm"].to_numpy() == city)
-        )
-        if len(fin_idx_city) == 0:
-            continue
-        fin_coords = np.column_stack([fin_lat_all[fin_idx_city],
-                                       fin_lon_all[fin_idx_city]])
-        tree = cKDTree(fin_coords)
-        ap_coords = np.column_stack([ap_lat_all[ap_idx_city],
-                                      ap_lon_all[ap_idx_city]])
+    # ---------- Приоритет 2: координаты ≤ EPS_M ----------
+    # FIX п.11: итерируем только по непокрытым П1 АП (экономия KDTree/запросов)
+    ap_need_geo = ap_work[~addr_ok]
+    if len(ap_need_geo) > 0:
+        for city, ap_idx_city in ap_need_geo.groupby("_city_norm").groups.items():
+            ap_idx_city = np.asarray(ap_idx_city)  # позиции в ap_work (RangeIndex)
+            fin_idx_city = np.flatnonzero(
+                fin_has_coords & (fin["_city_norm"].to_numpy() == city)
+            )
+            if len(fin_idx_city) == 0:
+                continue
+            fin_coords = np.column_stack([fin_lat_all[fin_idx_city],
+                                           fin_lon_all[fin_idx_city]])
+            tree = cKDTree(fin_coords)
+            ap_coords = np.column_stack([ap_lat_all[ap_idx_city],
+                                          ap_lon_all[ap_idx_city]])
 
-        cos_lat = np.clip(np.cos(np.radians(ap_coords[:, 0])), 0.1, 1.0)
-        r_deg = (eps_m * 3.0) / 111320.0 / cos_lat
-        r_max = float(np.max(r_deg))
+            cos_lat = np.clip(np.cos(np.radians(ap_coords[:, 0])), 0.1, 1.0)
+            r_deg = (EPS_M * 3.0) / 111320.0 / cos_lat
+            r_max = float(np.max(r_deg))
 
-        neighbours = tree.query_ball_point(ap_coords, r_max)
-        a_local, f_local = [], []
-        for i, lst in enumerate(neighbours):
-            if lst:
-                a_local.extend([i] * len(lst))
-                f_local.extend(lst)
-        if not a_local:
-            continue
-        a_local = np.array(a_local); f_local = np.array(f_local)
-        dist = haversine_np(ap_coords[a_local, 0], ap_coords[a_local, 1],
-                            fin_coords[f_local, 0], fin_coords[f_local, 1])
-        mask = dist <= eps_m
-        if not mask.any():
-            continue
-        tmp = pd.DataFrame({
-            "ap": ap_idx_city[a_local[mask]],
-            "fin": fin_idx_city[f_local[mask]],
-            "d": dist[mask],
-        }).sort_values("d").drop_duplicates("ap", keep="first")
-        # не перетираем уже найденных по адресу
-        tmp = tmp[~addr_ok[tmp["ap"].to_numpy()]]
-        if len(tmp) == 0:
-            continue
-        a = tmp["ap"].to_numpy()
-        geo_ok[a] = True
-        geo_fin[a] = tmp["fin"].to_numpy()
-        geo_dist[a] = tmp["d"].to_numpy()
+            neighbours = tree.query_ball_point(ap_coords, r_max)
+            a_local, f_local = [], []
+            for i, lst in enumerate(neighbours):
+                if lst:
+                    a_local.extend([i] * len(lst))
+                    f_local.extend(lst)
+            if not a_local:
+                continue
+            a_local = np.array(a_local); f_local = np.array(f_local)
+            dist = haversine_np(ap_coords[a_local, 0], ap_coords[a_local, 1],
+                                fin_coords[f_local, 0], fin_coords[f_local, 1])
+            mask = dist <= EPS_M
+            if not mask.any():
+                continue
+            tmp = pd.DataFrame({
+                "ap": ap_idx_city[a_local[mask]],
+                "fin": fin_idx_city[f_local[mask]],
+                "d": dist[mask],
+            }).sort_values("d").drop_duplicates("ap", keep="first")
+            tmp = tmp[~addr_ok[tmp["ap"].to_numpy()]]
+            if len(tmp) == 0:
+                continue
+            a = tmp["ap"].to_numpy()
+            geo_ok[a] = True
+            geo_fin[a] = tmp["fin"].to_numpy()
+            geo_dist[a] = tmp["d"].to_numpy()
 
-    # ---------- Приоритет 2: ближайший магазин, но ≤ max_prio2_km ----------
-    prio2_ok = np.zeros(n_ap, dtype=bool)
-    prio2_fin = np.full(n_ap, -1, dtype=int)
-    prio2_dist = np.full(n_ap, np.nan)
+    # ---------- Приоритет 3: ближайший оставшийся ----------
+    prio3_ok = np.zeros(n_ap, dtype=bool)
+    prio3_fin = np.full(n_ap, -1, dtype=int)
+    prio3_dist = np.full(n_ap, np.nan)
 
-    need_p2 = ~(addr_ok | geo_ok)
-    max_prio2_m = max_prio2_km * 1000.0
+    need_p3 = ~(addr_ok | geo_ok)
+    max_prio3_m = (max_prio3_km * 1000.0) if max_prio3_km and max_prio3_km > 0 else None
 
-    for city, ap_idx_city in ap_work[need_p2].groupby("_city_norm").groups.items():
-        ap_idx_city = np.asarray(ap_idx_city)
-        fin_idx_city = np.flatnonzero(
-            fin_has_coords & (fin["_city_norm"].to_numpy() == city)
-        )
-        if len(fin_idx_city) == 0:
-            continue
-        fin_coords = np.column_stack([fin_lat_all[fin_idx_city],
-                                       fin_lon_all[fin_idx_city]])
-        tree = cKDTree(fin_coords)
-        ap_coords = np.column_stack([ap_lat_all[ap_idx_city],
-                                      ap_lon_all[ap_idx_city]])
-        d, idx = tree.query(ap_coords, k=1)
-        within = d <= max_prio2_m
-        if not within.any():
-            continue
-        a = ap_idx_city[within]
-        prio2_ok[a] = True
-        prio2_fin[a] = fin_idx_city[idx[within]]
-        prio2_dist[a] = d[within]
+    if need_p3.any():
+        for city, ap_idx_city in ap_work[need_p3].groupby("_city_norm").groups.items():
+            ap_idx_city = np.asarray(ap_idx_city)
+            fin_idx_city = np.flatnonzero(
+                fin_has_coords & (fin["_city_norm"].to_numpy() == city)
+            )
+            if len(fin_idx_city) == 0:
+                continue
+            fin_coords = np.column_stack([fin_lat_all[fin_idx_city],
+                                           fin_lon_all[fin_idx_city]])
+            tree = cKDTree(fin_coords)
+            ap_coords = np.column_stack([ap_lat_all[ap_idx_city],
+                                          ap_lon_all[ap_idx_city]])
+            d, idx = tree.query(ap_coords, k=1)
+            if max_prio3_m is not None:
+                within = d <= max_prio3_m
+                if not within.any():
+                    continue
+                a = ap_idx_city[within]
+                prio3_ok[a] = True
+                prio3_fin[a] = fin_idx_city[idx[within]]
+                prio3_dist[a] = d[within]
+            else:
+                a = ap_idx_city
+                prio3_ok[a] = True
+                prio3_fin[a] = fin_idx_city[idx]
+                prio3_dist[a] = d
 
-    # ---------- Сборка результата (FIX: без коллизий колонок) ----------
-    # Базовые поля АП — сразу с суффиксом _АП для координат/города
-    ap_cols_out = [
-        "ID_Точки", "название", "адрес",
-        "Широта", "Долгота", "Полигон", "город", "тип", "сеть", "база",
-    ]
+    # ---------- Лимит X: П1 → П2 → П3 ----------
+    taken = np.zeros(n_ap, dtype=bool)
+
+    # FIX п.3/п.12: NaN в П1 гарантированно уходит в конец (inf-замена), stable sort
+    p1_idx = np.flatnonzero(addr_ok)
+    if len(p1_idx) > 0:
+        d1 = addr_dist[p1_idx]
+        d1_sort = np.where(np.isnan(d1), np.inf, d1)
+        p1_order = p1_idx[np.argsort(d1_sort, kind="stable")]
+        if len(p1_order) > n_target:
+            p1_order = p1_order[:n_target]
+        taken[p1_order] = True
+
+    remaining = n_target - int(taken.sum())
+    if remaining > 0:
+        p2_idx = np.flatnonzero(geo_ok & ~taken)
+        if len(p2_idx) > 0:
+            p2_order = p2_idx[np.argsort(geo_dist[p2_idx], kind="stable")][:remaining]
+            taken[p2_order] = True
+
+    remaining = n_target - int(taken.sum())
+    if remaining > 0:
+        p3_idx = np.flatnonzero(prio3_ok & ~taken)
+        if len(p3_idx) > 0:
+            p3_order = p3_idx[np.argsort(prio3_dist[p3_idx], kind="stable")][:remaining]
+            taken[p3_order] = True
+
+    # ---------- Сборка результата ----------
+    ap_cols_out = ["ID_Точки", "название", "адрес",
+                   "Широта", "Долгота", "Полигон", "город", "тип", "сеть", "база"]
     ap_cols_present = [c for c in ap_cols_out if c in ap_work.columns]
     out = ap_work[ap_cols_present].copy()
     out = out.rename(columns={
@@ -568,42 +602,40 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, eps_m: float,
     out["Совпадение по адресу (ДА/НЕТ)"] = np.where(addr_ok, "ДА", "НЕТ")
     out["Совпадение по ГЕО (ДА/НЕТ)"] = np.where(geo_ok, "ДА", "НЕТ")
     out["Совпадение по Адресу ИЛИ ГЕО (ДА/НЕТ)"] = np.where(addr_ok | geo_ok, "ДА", "НЕТ")
-    out["Приоритет 1 (ДА/НЕТ)"] = np.where(addr_ok | geo_ok, "ДА", "НЕТ")
-    out["Приоритет 2 (ДА/НЕТ)"] = np.where(~(addr_ok | geo_ok) & prio2_ok, "ДА", "НЕТ")
+    out["Приоритет 1 (ДА/НЕТ)"] = np.where(addr_ok, "ДА", "НЕТ")
+    out["Приоритет 2 (ДА/НЕТ)"] = np.where(~addr_ok & geo_ok, "ДА", "НЕТ")
+    out["Приоритет 3 (ДА/НЕТ)"] = np.where(~addr_ok & ~geo_ok & prio3_ok, "ДА", "НЕТ")
 
-    chosen_fin = np.where(addr_ok, addr_fin, np.where(geo_ok, geo_fin, prio2_fin))
-    chosen_dist = np.where(addr_ok, addr_dist, np.where(geo_ok, geo_dist, prio2_dist))
-    chosen_ok = addr_ok | geo_ok | prio2_ok
-
+    chosen_fin = np.where(addr_ok, addr_fin,
+                  np.where(geo_ok, geo_fin, prio3_fin))
+    chosen_dist = np.where(addr_ok, addr_dist,
+                   np.where(geo_ok, geo_dist, prio3_dist))
     out["Расстояние по гео"] = chosen_dist
-    out["_chosen_fin"] = chosen_fin
-    out["_chosen_ok"] = chosen_ok
-    out["_prio_num"] = np.where(addr_ok | geo_ok, 1, np.where(prio2_ok, 2, 3))
 
-    # фин-поля — через reindex, чтобы не падать при отсутствии колонки
-    fin_out_cols = [
-        "ТЕРРИТОРИЯ", "КЛАСТЕР", "ИМЯ МАГАЗИНА", "SAP НОМЕР МАГАЗИНА",
-        "АК наименование", "УА ПЛАНОГРАММЫ", "СТАТУС МАГАЗИНА", "Адрес",
-        "город", "Широта", "Долгота",
-    ]
+    out["_chosen_fin"] = chosen_fin
+    out["_taken"] = taken
+    out["_prio_num"] = np.where(addr_ok, 1, np.where(geo_ok, 2,
+                       np.where(prio3_ok, 3, 4)))
+
+    # FIX п.16: сначала отсекаем по taken, потом мержим фин-поля — меньше работы
+    out = out[out["_taken"]].copy()
+
+    fin_out_cols = ["ТЕРРИТОРИЯ", "КЛАСТЕР", "ИМЯ МАГАЗИНА", "SAP НОМЕР МАГАЗИНА",
+                    "АК наименование", "УА ПЛАНОГРАММЫ", "СТАТУС МАГАЗИНА",
+                    "Адрес", "город", "Широта", "Долгота"]
     fin_cols_present = [c for c in fin_out_cols if c in fin.columns]
-    valid = out["_chosen_fin"].to_numpy() >= 0
-    fin_lookup = fin.loc[out.loc[valid, "_chosen_fin"].astype(int).to_numpy(),
-                         fin_cols_present].copy()
-    fin_lookup.index = out.index[valid]
-    for c in fin_cols_present:
-        out[c] = fin_lookup[c].reindex(out.index)
-    # недостающие фин-колонки — как NaN, чтобы схема была стабильной
+
+    if len(out) > 0:
+        chosen_vals = out["_chosen_fin"].astype(int).to_numpy()
+        fin_lookup = fin.loc[chosen_vals, fin_cols_present].copy()
+        fin_lookup.index = out.index
+        for c in fin_cols_present:
+            out[c] = fin_lookup[c]
     for c in fin_out_cols:
         if c not in out.columns:
             out[c] = np.nan
 
-    # только подбранные
-    out = out[out["_chosen_ok"]].copy()
-    # сортировка: Приоритет 1 → 2, внутри по расстоянию
     out = out.sort_values(["_prio_num", "Расстояние по гео"], na_position="last")
-    out = out.head(n_target).copy()
-
     return out
 
 # =========================================================
@@ -626,13 +658,12 @@ if file_fin and file_ap:
     st.write(f"Фин ап: {len(fin)} строк. Возможная АП: {len(ap)} строк.")
 
     with st.spinner("Подбираем..."):
-        result = match(fin, ap, float(eps_m), float(max_prio2_km), int(n_target))
+        result = match(fin, ap, int(n_target), float(max_prio3_km))
 
     if result.empty:
         st.warning("Не удалось подобрать ни одной АП (нет координат / городов / магазинов).")
         st.stop()
 
-    # FIX: final собираем из явных колонок, без повторного rename
     final = pd.DataFrame({
         "ID_Точки": result["ID_Точки"],
         "название": result["название"],
@@ -649,6 +680,7 @@ if file_fin and file_ap:
         "Совпадение по Адресу ИЛИ ГЕО (ДА/НЕТ)": result["Совпадение по Адресу ИЛИ ГЕО (ДА/НЕТ)"],
         "Приоритет 1 (ДА/НЕТ)": result["Приоритет 1 (ДА/НЕТ)"],
         "Приоритет 2 (ДА/НЕТ)": result["Приоритет 2 (ДА/НЕТ)"],
+        "Приоритет 3 (ДА/НЕТ)": result["Приоритет 3 (ДА/НЕТ)"],
         "Расстояние по гео": result["Расстояние по гео"],
         "ТЕРРИТОРИЯ": result["ТЕРРИТОРИЯ"],
         "КЛАСТЕР": result["КЛАСТЕР"],
@@ -663,29 +695,28 @@ if file_fin and file_ap:
         "Долгота": result["Долгота"],
     })
 
-    st.success(f"Подобрано {len(final)} из {n_target} (цель).")
+    st.success(f"Подобрано {len(final)} из {n_target} (цель). Достигли X — стоп.")
     st.dataframe(final.head(50), use_container_width=True)
 
-    # Excel
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
         final.to_excel(w, index=False, sheet_name="Результат")
-
-        prio1 = int((final["Приоритет 1 (ДА/НЕТ)"] == "ДА").sum())
-        prio2 = int((final["Приоритет 2 (ДА/НЕТ)"] == "ДА").sum())
+        p1 = int((final["Приоритет 1 (ДА/НЕТ)"] == "ДА").sum())
+        p2 = int((final["Приоритет 2 (ДА/НЕТ)"] == "ДА").sum())
+        p3 = int((final["Приоритет 3 (ДА/НЕТ)"] == "ДА").sum())
         metrics = pd.DataFrame({
             "Показатель": [
-                "Цель подборов",
+                "Цель X",
                 "Подобрано всего",
-                "Приоритет 1 (адрес/координаты)",
-                "Приоритет 2 (ближайший по гео)",
-                "Не хватило исходных АП / нет координат",
+                "Приоритет 1 (адрес)",
+                f"Приоритет 2 (координаты ≤ {EPS_M:.0f} м)",
+                "Приоритет 3 (ближайшие, добивка)",
+                "Осталось до X (не хватило АП)",
             ],
             "Значение": [
                 int(n_target),
                 len(final),
-                prio1,
-                prio2,
+                p1, p2, p3,
                 max(0, int(n_target) - len(final)),
             ],
         })
