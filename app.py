@@ -19,23 +19,65 @@ st.title("Подбор ближайшего магазина фин-ап к во
 # =========================================================
 EPS_M = 15.0
 FUZZY_THRESHOLD = 0.88
+K_NEAREST = 10
 
 # =========================================================
-# Сайдбар
+# Дефолтные квоты по городам
+# =========================================================
+DEFAULT_QUOTAS = {
+    "волгоград": 92,
+    "воронеж": 126,
+    "екатеринбург": 173,
+    "иркутск": 50,
+    "казань": 125,
+    "краснодар": 76,
+    "красноярск": 50,
+    "москва": 578,
+    "нижний новгород": 134,
+    "новосибирск": 121,
+    "омск": 83,
+    "пермь": 86,
+    "ростов-на-дону": 131,
+    "самара": 167,
+    "санкт-петербург": 244,
+    "уфа": 87,
+    "челябинск": 74,
+}
+
+# =========================================================
+# Сайдбар — квоты по городам
 # =========================================================
 with st.sidebar:
-    st.header("Настройки")
-    n_target = st.number_input(
-        "Кол-во подборов (X)",
-        min_value=1, max_value=100_000, value=2350, step=50,
-        help="Набрали X подборов — калькулятор останавливается.",
+    st.header("Квоты по городам")
+    quota_df = pd.DataFrame({
+        "Город": list(DEFAULT_QUOTAS.keys()),
+        "Квота": list(DEFAULT_QUOTAS.values()),
+    })
+    edited = st.data_editor(
+        quota_df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        column_config={
+            "Город": st.column_config.TextColumn(disabled=True),
+            "Квота": st.column_config.NumberColumn(min_value=0, step=1),
+        },
+        key="quota_editor",
     )
+    city_quotas = {
+        str(row["Город"]).strip().lower(): int(row["Квота"])
+        for _, row in edited.iterrows()
+        if int(row["Квота"]) > 0
+    }
+    total_quota = sum(city_quotas.values())
+    st.markdown(f"**Итого подборов (сумма квот): {total_quota}**")
 
 st.caption(
-    f"Приоритет 1 — совпадение адреса (3 канала: точный → fuzzy → уникальный дом). "
-    f"Приоритет 2 — координаты ≤ {EPS_M:.0f} м (жёстко). "
-    f"Приоритет 3 — топ ближайших пар, добиваем до {n_target}. "
-    f"Достигли {n_target} — стоп."
+    f"Приоритет 1 — совпадение адреса (3 канала). "
+    f"Приоритет 2 — координаты ≤ {EPS_M:.0f} м. "
+    f"Приоритет 3 — ближайший свободный магазин. "
+    f"Каждый магазин фин-ап используется не более 1 раза. "
+    f"Квоты по городам соблюдаются на каждом шаге."
 )
 
 # =========================================================
@@ -78,7 +120,7 @@ def norm_city_series(s: pd.Series) -> pd.Series:
     return out
 
 # =========================================================
-# Стоп-слова (единый список — выбрасываем всё)
+# Стоп-слова
 # =========================================================
 STREET_TYPE_TOKENS = {
     "ул", "улица", "пр", "прт", "проспект", "просп", "пер", "переулок",
@@ -102,7 +144,7 @@ REGION_MARKERS = {
 STOP_TOKENS = STREET_TYPE_TOKENS | BUILDING_MARKERS | REGION_MARKERS
 
 # =========================================================
-# Токенизация и стемы
+# Токенизация и нормализация адреса
 # =========================================================
 def _tokenize(addr: str) -> list:
     s = str(addr).lower().replace("ё", "е")
@@ -139,9 +181,6 @@ def _strip_tokens(tokens, city_norm):
         out.append(t)
     return out
 
-# =========================================================
-# Нормализация адреса — «мешок токенов»
-# =========================================================
 def normalize_address(addr: str, city_norm: str) -> dict:
     tokens = _tokenize(addr)
     tokens = _strip_tokens(tokens, city_norm)
@@ -150,7 +189,6 @@ def normalize_address(addr: str, city_norm: str) -> dict:
     token_set = "|".join(sorted_tokens)
     token_sort = " ".join(sorted_tokens)
     first_token = sorted_tokens[0] if sorted_tokens else ""
-    # _house_base — последний числовой токен (для канала 3)
     house_base = ""
     for t in reversed(tokens):
         if re.match(r"^\d", t):
@@ -246,21 +284,20 @@ def _prepare_keys(df: pd.DataFrame) -> pd.DataFrame:
 
 # =========================================================
 # Основной подбор
-#   П1 = адрес (3 канала: точный → fuzzy → уникальный дом)
-#   П2 = координаты ≤ EPS_M
-#   П3 = топ ближайших
-#   Лимит X: П1 → П2 → П3
 # =========================================================
 @st.cache_data(show_spinner=False)
-def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
+def match(fin: pd.DataFrame, ap: pd.DataFrame, city_quotas_tuple: tuple):
+    city_quotas = dict(city_quotas_tuple)
+
     fin = fin.reset_index(drop=True).copy()
     ap = ap.reset_index(drop=True).copy()
 
     ap_valid = ap["Широта"].notna() & ap["Долгота"].notna()
     ap_work = ap[ap_valid].reset_index(drop=True).copy()
     n_ap = len(ap_work)
-    if n_ap == 0:
-        return pd.DataFrame(), np.zeros(0, dtype=int)
+    n_fin = len(fin)
+    if n_ap == 0 or n_fin == 0:
+        return pd.DataFrame(), np.zeros(0, dtype=bool), {}
 
     fin_has_coords = (fin["Широта"].notna() & fin["Долгота"].notna()).to_numpy()
     fin_lat_all = fin["Широта"].to_numpy()
@@ -271,57 +308,85 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
     fin_key = _prepare_keys(fin)
     ap_key = _prepare_keys(ap_work).rename(columns={"_row": "_ap_idx"})
 
-    addr_ok = np.zeros(n_ap, dtype=bool)
-    addr_fin = np.full(n_ap, -1, dtype=int)
-    addr_dist = np.full(n_ap, np.nan)
-    addr_channel = np.zeros(n_ap, dtype=int)
+    fin_used = np.zeros(n_fin, dtype=bool)
+    ap_taken = np.zeros(n_ap, dtype=bool)
+    city_taken = {c: 0 for c in city_quotas}
+    ap_city = ap_work["_city_norm"].to_numpy()
 
-    geo_ok = np.zeros(n_ap, dtype=bool)
-    geo_fin = np.full(n_ap, -1, dtype=int)
-    geo_dist = np.full(n_ap, np.nan)
+    result_pairs = []
 
-    def _apply_channel(cand: pd.DataFrame, channel_no: int, rank_by: str = "_dist"):
+    def _city_has_room(city: str) -> bool:
+        return city_taken.get(city, 0) < city_quotas.get(city, 0)
+
+    def _try_take_pair(a: int, f: int, dist: float, priority: int, channel: int):
+        if ap_taken[a] or fin_used[f]:
+            return False
+        city = ap_city[a]
+        if city not in city_quotas:
+            return False
+        if not _city_has_room(city):
+            return False
+        ap_taken[a] = True
+        fin_used[f] = True
+        city_taken[city] += 1
+        result_pairs.append({
+            "ap_idx": int(a),
+            "fin_idx": int(f),
+            "priority": priority,
+            "channel": channel,
+            "dist": float(dist) if (dist is not None and not np.isnan(dist)) else np.nan,
+        })
+        return True
+
+    def _apply_channel_greedy(cand: pd.DataFrame, channel_no: int, priority_no: int,
+                              rank_by: str = "_dist"):
+        """
+        Жадный проход по cand (содержит _row, _ap_idx).
+        Если нет _dist — вычисляет haversine по координатам.
+        """
         if len(cand) == 0:
             return
-        cand = cand[~addr_ok[cand["_ap_idx"].to_numpy()]]
+        cand = cand[
+            ~fin_used[cand["_row"].to_numpy()]
+            & ~ap_taken[cand["_ap_idx"].to_numpy()]
+        ]
         if len(cand) == 0:
             return
-        f_rows = cand["_row"].to_numpy()
-        a_rows = cand["_ap_idx"].to_numpy()
-        both = fin_has_coords[f_rows]
-        d = np.full(len(cand), np.nan)
-        if both.any():
-            d[both] = haversine_np(
-                fin_lat_all[f_rows[both]], fin_lon_all[f_rows[both]],
-                ap_lat_all[a_rows[both]], ap_lon_all[a_rows[both]],
-            )
-        cand = cand.assign(_dist=d)
+
+        # FIX п.1: досчитываем _dist, если его нет
+        if "_dist" not in cand.columns:
+            f_rows = cand["_row"].to_numpy()
+            a_rows = cand["_ap_idx"].to_numpy()
+            both = fin_has_coords[f_rows]
+            d = np.full(len(cand), np.nan)
+            if both.any():
+                d[both] = haversine_np(
+                    fin_lat_all[f_rows[both]], fin_lon_all[f_rows[both]],
+                    ap_lat_all[a_rows[both]], ap_lon_all[a_rows[both]],
+                )
+            cand = cand.assign(_dist=d)
 
         if rank_by == "_dist":
-            best = (
-                cand.sort_values("_dist", na_position="last")
-                    .drop_duplicates("_ap_idx", keep="first")
-            )
+            cand = cand.sort_values("_dist", na_position="last")
         else:
-            best = (
-                cand.sort_values([rank_by, "_dist"],
-                                 ascending=[False, True], na_position="last")
-                    .drop_duplicates("_ap_idx", keep="first")
+            cand = cand.sort_values([rank_by, "_dist"],
+                                    ascending=[False, True], na_position="last")
+
+        for _, row in cand.iterrows():
+            _try_take_pair(
+                int(row["_ap_idx"]), int(row["_row"]),
+                float(row["_dist"]) if not np.isnan(row["_dist"]) else np.nan,
+                priority_no, channel_no,
             )
 
-        b_a = best["_ap_idx"].to_numpy()
-        addr_ok[b_a] = True
-        addr_fin[b_a] = best["_row"].to_numpy()
-        addr_dist[b_a] = best["_dist"].to_numpy()
-        addr_channel[b_a] = channel_no
-
-    # --- Канал 1: (город, token_set) ---
-    _apply_channel(
+    # ---------- П1: адресные каналы ----------
+    # канал 1: точное множество токенов
+    _apply_channel_greedy(
         fin_key.merge(ap_key, on=["_city_norm", "_token_set"], how="inner"),
-        1,
+        1, 1,
     )
 
-    # --- Канал 2: fuzzy по token_sort + (город, first_token) ---
+    # канал 2: fuzzy по token_sort + (город, first_token)
     fin_fuzzy = fin_key[["_row", "_city_norm", "_first_token",
                          "_token_sort"]].rename(
         columns={"_row": "_row_f", "_token_sort": "_token_sort_f"}
@@ -330,11 +395,12 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
                        "_token_sort"]].rename(
         columns={"_token_sort": "_token_sort_a"}
     )
-    cand2 = ap_fuzzy.merge(
-        fin_fuzzy, on=["_city_norm", "_first_token"], how="inner",
-    )
+    cand2 = ap_fuzzy.merge(fin_fuzzy, on=["_city_norm", "_first_token"], how="inner")
     if len(cand2) > 0:
-        cand2 = cand2[~addr_ok[cand2["_ap_idx"].to_numpy()]]
+        cand2 = cand2[
+            ~fin_used[cand2["_row_f"].to_numpy()]
+            & ~ap_taken[cand2["_ap_idx"].to_numpy()]
+        ]
     if len(cand2) > 0:
         ratios = np.fromiter(
             (SequenceMatcher(None, a, f).ratio()
@@ -344,13 +410,13 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
         cand2 = cand2.assign(_ratio=ratios)
         cand2 = cand2[cand2["_ratio"] >= FUZZY_THRESHOLD]
         if len(cand2) > 0:
-            _apply_channel(
-                cand2[["_row_f", "_ap_idx", "_ratio"]].rename(columns={"_row_f": "_row"}),
-                2,
-                rank_by="_ratio",
+            cand2 = cand2[["_row_f", "_ap_idx", "_ratio"]].rename(
+                columns={"_row_f": "_row"}
             )
+            # _dist досчитается внутри _apply_channel_greedy
+            _apply_channel_greedy(cand2, 2, 1, rank_by="_ratio")
 
-    # --- Канал 3: (город, house_base) при уникальной token_set ---
+    # канал 3: уникальный дом в городе
     ap_uniq = (ap_key.groupby(["_city_norm", "_house_base"])["_token_set"]
                .nunique().reset_index().rename(columns={"_token_set": "_ap_nuniq"}))
     fin_uniq = (fin_key.groupby(["_city_norm", "_house_base"])["_token_set"]
@@ -364,16 +430,21 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
                                      on=["_city_norm", "_house_base"], how="inner")
         cand3 = fin_key_uniq.merge(ap_key_uniq, on=["_city_norm", "_house_base"],
                                    how="inner")
-        if len(cand3) > 0:
-            _apply_channel(cand3[["_row", "_ap_idx"]], 3)
+        # _dist досчитается внутри
+        _apply_channel_greedy(cand3[["_row", "_ap_idx"]], 3, 1)
 
-    # ---------- П2: координаты ≤ EPS_M ----------
-    ap_need_geo = ap_work[~addr_ok]
+    # ---------- П2: координаты ≤ EPS_M (жадно по расстоянию) ----------
+    ap_need_geo = ap_work[~ap_taken]
+    geo_candidates = []
     if len(ap_need_geo) > 0:
         for city, ap_idx_city in ap_need_geo.groupby("_city_norm").groups.items():
+            if city not in city_quotas or not _city_has_room(city):
+                continue
             ap_idx_city = np.asarray(ap_idx_city)
             fin_idx_city = np.flatnonzero(
-                fin_has_coords & (fin["_city_norm"].to_numpy() == city)
+                fin_has_coords
+                & (fin["_city_norm"].to_numpy() == city)
+                & ~fin_used
             )
             if len(fin_idx_city) == 0:
                 continue
@@ -382,11 +453,9 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
             tree = cKDTree(fin_coords)
             ap_coords = np.column_stack([ap_lat_all[ap_idx_city],
                                           ap_lon_all[ap_idx_city]])
-
             cos_lat = np.clip(np.cos(np.radians(ap_coords[:, 0])), 0.1, 1.0)
             r_deg = (EPS_M * 3.0) / 111320.0 / cos_lat
             r_max = float(np.max(r_deg))
-
             neighbours = tree.query_ball_point(ap_coords, r_max)
             a_local, f_local = [], []
             for i, lst in enumerate(neighbours):
@@ -401,30 +470,32 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
             mask = dist <= EPS_M
             if not mask.any():
                 continue
-            tmp = pd.DataFrame({
-                "ap": ap_idx_city[a_local[mask]],
-                "fin": fin_idx_city[f_local[mask]],
-                "d": dist[mask],
-            }).sort_values("d").drop_duplicates("ap", keep="first")
-            tmp = tmp[~addr_ok[tmp["ap"].to_numpy()]]
-            if len(tmp) == 0:
+            for ai, fi, di in zip(
+                ap_idx_city[a_local[mask]],
+                fin_idx_city[f_local[mask]],
+                dist[mask],
+            ):
+                geo_candidates.append((int(ai), int(fi), float(di)))
+
+    if geo_candidates:
+        geo_df = pd.DataFrame(geo_candidates, columns=["_ap_idx", "_row", "_dist"])
+        geo_df = geo_df.sort_values("_dist")
+        for _, row in geo_df.iterrows():
+            _try_take_pair(int(row["_ap_idx"]), int(row["_row"]),
+                           float(row["_dist"]), 2, 0)
+
+    # ---------- П3: k ближайших свободных (жадно) ----------
+    ap_need_p3 = ap_work[~ap_taken]
+    p3_candidates = []
+    if len(ap_need_p3) > 0:
+        for city, ap_idx_city in ap_need_p3.groupby("_city_norm").groups.items():
+            if city not in city_quotas or not _city_has_room(city):
                 continue
-            a = tmp["ap"].to_numpy()
-            geo_ok[a] = True
-            geo_fin[a] = tmp["fin"].to_numpy()
-            geo_dist[a] = tmp["d"].to_numpy()
-
-    # ---------- П3: ближайший без порога ----------
-    prio3_ok = np.zeros(n_ap, dtype=bool)
-    prio3_fin = np.full(n_ap, -1, dtype=int)
-    prio3_dist = np.full(n_ap, np.nan)
-
-    need_p3 = ~(addr_ok | geo_ok)
-    if need_p3.any():
-        for city, ap_idx_city in ap_work[need_p3].groupby("_city_norm").groups.items():
             ap_idx_city = np.asarray(ap_idx_city)
             fin_idx_city = np.flatnonzero(
-                fin_has_coords & (fin["_city_norm"].to_numpy() == city)
+                fin_has_coords
+                & (fin["_city_norm"].to_numpy() == city)
+                & ~fin_used
             )
             if len(fin_idx_city) == 0:
                 continue
@@ -433,100 +504,81 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
             tree = cKDTree(fin_coords)
             ap_coords = np.column_stack([ap_lat_all[ap_idx_city],
                                           ap_lon_all[ap_idx_city]])
-            _d_deg, idx = tree.query(ap_coords, k=1)
-            d_m = haversine_np(
-                ap_coords[:, 0], ap_coords[:, 1],
-                fin_coords[idx, 0], fin_coords[idx, 1],
-            )
-            a = ap_idx_city
-            prio3_ok[a] = True
-            prio3_fin[a] = fin_idx_city[idx]
-            prio3_dist[a] = d_m
+            k = min(K_NEAREST, len(fin_coords))
+            d_mat, idx_mat = tree.query(ap_coords, k=k)
+            if k == 1:
+                d_mat = d_mat[:, None]
+                idx_mat = idx_mat[:, None]
+            # векторный пересчёт в метры
+            for i in range(len(ap_idx_city)):
+                valid = np.isfinite(d_mat[i])
+                if not valid.any():
+                    continue
+                j_valid = np.flatnonzero(valid)
+                f_glob = fin_idx_city[idx_mat[i, j_valid]]
+                d_m = haversine_np(
+                    ap_coords[i, 0], ap_coords[i, 1],
+                    fin_coords[idx_mat[i, j_valid], 0],
+                    fin_coords[idx_mat[i, j_valid], 1],
+                )
+                for f_g, d_g in zip(f_glob, d_m):
+                    p3_candidates.append((int(ap_idx_city[i]), int(f_g), float(d_g)))
 
-    # ---------- Лимит X ----------
-    taken = np.zeros(n_ap, dtype=bool)
-
-    p1_idx = np.flatnonzero(addr_ok)
-    if len(p1_idx) > 0:
-        d1 = addr_dist[p1_idx]
-        d1_sort = np.where(np.isnan(d1), np.inf, d1)
-        p1_order = p1_idx[np.argsort(d1_sort, kind="stable")]
-        if len(p1_order) > n_target:
-            p1_order = p1_order[:n_target]
-        taken[p1_order] = True
-
-    remaining = n_target - int(taken.sum())
-    if remaining > 0:
-        p2_idx = np.flatnonzero(geo_ok & ~taken)
-        if len(p2_idx) > 0:
-            p2_order = p2_idx[np.argsort(geo_dist[p2_idx], kind="stable")][:remaining]
-            taken[p2_order] = True
-
-    remaining = n_target - int(taken.sum())
-    if remaining > 0:
-        p3_idx = np.flatnonzero(prio3_ok & ~taken)
-        if len(p3_idx) > 0:
-            p3_order = p3_idx[np.argsort(prio3_dist[p3_idx], kind="stable")][:remaining]
-            taken[p3_order] = True
+    if p3_candidates:
+        p3_df = pd.DataFrame(p3_candidates, columns=["_ap_idx", "_row", "_dist"])
+        p3_df = p3_df.sort_values("_dist")
+        for _, row in p3_df.iterrows():
+            _try_take_pair(int(row["_ap_idx"]), int(row["_row"]),
+                           float(row["_dist"]), 3, 0)
 
     # ---------- Сборка ----------
+    if not result_pairs:
+        return pd.DataFrame(), fin_used, city_taken
+
+    pairs_df = pd.DataFrame(result_pairs)
+
     ap_cols_out = ["ID_Точки", "название", "адрес",
                    "Широта", "Долгота", "Полигон", "город", "тип", "сеть", "база"]
     ap_cols_present = [c for c in ap_cols_out if c in ap_work.columns]
-    out = ap_work[ap_cols_present].copy()
-    out = out.rename(columns={
+    ap_part = ap_work.loc[pairs_df["ap_idx"].to_numpy(), ap_cols_present].reset_index(drop=True)
+    ap_part = ap_part.rename(columns={
         "Широта": "Широта_АП",
         "Долгота": "Долгота_АП",
         "город": "город_АП",
     })
 
-    out["Совпадение по адресу (ДА/НЕТ)"] = np.where(addr_ok, "ДА", "НЕТ")
-    out["Совпадение по ГЕО (ДА/НЕТ)"] = np.where(geo_ok, "ДА", "НЕТ")
-    out["Совпадение по Адресу ИЛИ ГЕО (ДА/НЕТ)"] = np.where(addr_ok | geo_ok, "ДА", "НЕТ")
-    out["Приоритет 1 (ДА/НЕТ)"] = np.where(addr_ok, "ДА", "НЕТ")
-    out["Приоритет 2 (ДА/НЕТ)"] = np.where(~addr_ok & geo_ok, "ДА", "НЕТ")
-    out["Приоритет 3 (ДА/НЕТ)"] = np.where(~addr_ok & ~geo_ok & prio3_ok, "ДА", "НЕТ")
-
-    out["Канал адреса"] = np.where(addr_ok, addr_channel, 0).astype(int)
-
-    out["Токены_АП"] = ap_work["_token_raw"].to_numpy()
-
-    chosen_fin = np.where(addr_ok, addr_fin,
-                  np.where(geo_ok, geo_fin, prio3_fin))
-    chosen_dist = np.where(addr_ok, addr_dist,
-                   np.where(geo_ok, geo_dist, prio3_dist))
-    out["Расстояние по гео,м"] = chosen_dist
-
-    out["_chosen_fin"] = chosen_fin
-    out["_taken"] = taken
-    out["_prio_num"] = np.where(addr_ok, 1, np.where(geo_ok, 2,
-                       np.where(prio3_ok, 3, 4)))
-
-    out = out[out["_taken"]].copy()
-
-    fin_out_cols = ["ТЕРРИТОРИЯ", "КЛАСТЕР", "ИМЯ МАГАЗИНА", "SAP НОМЕР МАГАЗИНА",
+    fin_cols_out = ["ТЕРРИТОРИЯ", "КЛАСТЕР", "ИМЯ МАГАЗИНА", "SAP НОМЕР МАГАЗИНА",
                     "АК наименование", "УА ПЛАНОГРАММЫ", "СТАТУС МАГАЗИНА",
                     "Адрес", "город", "Широта", "Долгота"]
-    fin_cols_present = [c for c in fin_out_cols if c in fin.columns]
+    fin_cols_present = [c for c in fin_cols_out if c in fin.columns]
+    fin_part = fin.loc[pairs_df["fin_idx"].to_numpy(), fin_cols_present].reset_index(drop=True)
 
-    if len(out) > 0:
-        chosen_vals = out["_chosen_fin"].astype(int).to_numpy()
-        fin_lookup = fin.loc[chosen_vals, fin_cols_present].copy()
-        fin_lookup.index = out.index
-        for c in fin_cols_present:
-            out[c] = fin_lookup[c]
-        fin_diag = fin.loc[chosen_vals, ["_token_raw"]].copy()
-        fin_diag.index = out.index
-        out["Токены_фин"] = fin_diag["_token_raw"]
-    else:
-        out["Токены_фин"] = np.nan
+    out = pd.concat([ap_part, fin_part], axis=1)
 
-    for c in fin_out_cols:
+    # FIX п.35: добавляем _city_norm_АП для корректных метрик по городам
+    out["_city_norm_АП"] = ap_work["_city_norm"].to_numpy()[pairs_df["ap_idx"].to_numpy()]
+
+    pr = pairs_df["priority"].to_numpy()
+    ch = pairs_df["channel"].to_numpy()
+    dist = pairs_df["dist"].to_numpy()
+
+    out["Совпадение по адресу (ДА/НЕТ)"] = np.where(pr == 1, "ДА", "НЕТ")
+    out["Совпадение по ГЕО (ДА/НЕТ)"] = np.where(pr == 2, "ДА", "НЕТ")
+    out["Совпадение по Адресу ИЛИ ГЕО (ДА/НЕТ)"] = np.where(pr <= 2, "ДА", "НЕТ")
+    out["Приоритет 1 (ДА/НЕТ)"] = np.where(pr == 1, "ДА", "НЕТ")
+    out["Приоритет 2 (ДА/НЕТ)"] = np.where(pr == 2, "ДА", "НЕТ")
+    out["Приоритет 3 (ДА/НЕТ)"] = np.where(pr == 3, "ДА", "НЕТ")
+    out["Канал адреса"] = np.where(pr == 1, ch, 0).astype(int)
+    out["Расстояние по гео,м"] = dist
+
+    out["_prio_num"] = pr
+
+    for c in fin_cols_out:
         if c not in out.columns:
             out[c] = np.nan
 
     out = out.sort_values(["_prio_num", "Расстояние по гео,м"], na_position="last")
-    return out, addr_channel
+    return out, fin_used, city_taken
 
 # =========================================================
 # UI
@@ -537,7 +589,7 @@ with col1:
 with col2:
     file_ap = st.file_uploader("Файл 2: возможная АП (.xlsx)", type=["xlsx"], key="ap")
 
-if file_fin and file_ap:
+if file_fin and file_ap and total_quota > 0:
     try:
         fin = load_fin(file_fin.getvalue())
         ap = load_ap(file_ap.getvalue())
@@ -545,13 +597,16 @@ if file_fin and file_ap:
         st.error(str(e))
         st.stop()
 
-    st.write(f"Фин ап: {len(fin)} строк. Возможная АП: {len(ap)} строк.")
+    st.write(f"Фин ап: {len(fin)} строк. Возможная АП: {len(ap)} строк. "
+             f"Суммарная квота: {total_quota}.")
 
     with st.spinner("Подбираем..."):
-        result, _channel = match(fin, ap, int(n_target))
+        result, fin_used, city_taken = match(
+            fin, ap, tuple(sorted(city_quotas.items()))
+        )
 
     if result.empty:
-        st.warning("Не удалось подобрать ни одной АП (нет координат / городов / магазинов).")
+        st.warning("Не удалось подобрать ни одной пары (нет координат / городов / магазинов).")
         st.stop()
 
     final = pd.DataFrame({
@@ -581,11 +636,17 @@ if file_fin and file_ap:
         "Долгота": result["Долгота"],
     })
 
-    st.success(f"Подобрано {len(final)} из {n_target} (цель). Достигли X — стоп.")
+    st.success(f"Подобрано {len(final)} (суммарная квота {total_quota}).")
     st.dataframe(final.head(50), use_container_width=True)
 
-    diag_fin = fin[["Адрес", "город", "_city_norm", "_token_raw",
-                    "_token_set", "_house_base"]].copy()
+    # диагностика
+    diag_fin = fin[["Адрес", "город", "_city_norm", "_token_raw", "_token_set",
+                    "_house_base"]].copy()
+    # FIX п.6: fin_used корректной длины и типа
+    if len(fin_used) == len(diag_fin):
+        diag_fin["использован"] = np.where(fin_used, "ДА", "НЕТ")
+    else:
+        diag_fin["использован"] = "?"
     diag_fin = diag_fin.rename(columns={
         "_city_norm": "город_norm",
         "_token_raw": "токены",
@@ -602,39 +663,65 @@ if file_fin and file_ap:
         "_house_base": "дом_база",
     })
 
+    # FIX п.35: метрики по городам — через _city_norm_АП
+    quota_rows = []
+    res_city = result["_city_norm_АП"].to_numpy()
+    for city, q in city_quotas.items():
+        mask_c = res_city == city
+        p1 = int((mask_c & (result["Приоритет 1 (ДА/НЕТ)"] == "ДА").to_numpy()).sum())
+        p2 = int((mask_c & (result["Приоритет 2 (ДА/НЕТ)"] == "ДА").to_numpy()).sum())
+        p3 = int((mask_c & (result["Приоритет 3 (ДА/НЕТ)"] == "ДА").to_numpy()).sum())
+        taken = city_taken.get(city, 0)
+        quota_rows.append({
+            "Город": city,
+            "Квота": q,
+            "Подобрано": taken,
+            "П1": p1, "П2": p2, "П3": p3,
+            "Остаток": max(0, q - taken),
+        })
+    quota_metrics = pd.DataFrame(quota_rows).sort_values("Город")
+
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
         final.to_excel(w, index=False, sheet_name="Результат")
         diag_fin.to_excel(w, index=False, sheet_name="Разбор_фин")
         diag_ap.to_excel(w, index=False, sheet_name="Разбор_АП")
+        quota_metrics.to_excel(w, index=False, sheet_name="Квоты_по_городам")
 
         p1 = int((final["Приоритет 1 (ДА/НЕТ)"] == "ДА").sum())
         p2 = int((final["Приоритет 2 (ДА/НЕТ)"] == "ДА").sum())
         p3 = int((final["Приоритет 3 (ДА/НЕТ)"] == "ДА").sum())
-
         ch_counts = result.loc[result["Приоритет 1 (ДА/НЕТ)"] == "ДА", "Канал адреса"]
         ch1 = int((ch_counts == 1).sum())
         ch2 = int((ch_counts == 2).sum())
         ch3 = int((ch_counts == 3).sum())
 
+        ap_cities = set(ap["_city_norm"].unique())
+        out_of_quota_cities = ap_cities - set(city_quotas.keys())
+        n_ap_out = int(ap["_city_norm"].isin(out_of_quota_cities).sum())
+
         metrics = pd.DataFrame({
             "Показатель": [
-                "Цель X",
+                "Суммарная квота",
                 "Подобрано всего",
-                "Приоритет 1 (адрес), всего",
+                "Приоритет 1 (адрес)",
                 "  канал 1: точное множество токенов",
-                f"  канал 2: fuzzy токенов ≥ {FUZZY_THRESHOLD}",
-                "  канал 3: уникальный дом в городе",
+                f"  канал 2: fuzzy ≥ {FUZZY_THRESHOLD}",
+                "  канал 3: уникальный дом",
                 f"Приоритет 2 (координаты ≤ {EPS_M:.0f} м)",
-                "Приоритет 3 (ближайшие, добивка)",
-                "Осталось до X (не хватило АП)",
+                "Приоритет 3 (ближайший свободный)",
+                "Магазинов фин использовано",
+                "Магазинов фин всего",
+                "АП вне квот (пропущены)",
             ],
             "Значение": [
-                int(n_target),
+                int(total_quota),
                 len(final),
                 p1, ch1, ch2, ch3,
                 p2, p3,
-                max(0, int(n_target) - len(final)),
+                int(fin_used.sum()) if len(fin_used) == len(fin) else 0,
+                int(len(fin)),
+                n_ap_out,
             ],
         })
         metrics.to_excel(w, index=False, sheet_name="Метрики")
