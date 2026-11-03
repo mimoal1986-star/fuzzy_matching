@@ -60,14 +60,12 @@ CITY_SYNONYMS = {
     "ростовнадону": "ростов-на-дону",
 }
 
-# стемы прилагательных регионов — ловят все падежи
 REGION_ADJ_STEMS = {
     "московск", "ленинградск", "свердловск", "челябинск",
     "нижегородск", "воронежск", "ростовск", "волгоградск",
     "самарск", "иркутск", "омск", "новосибирск", "красноярск",
     "пермск", "краснодарск", "приморск", "хабаровск",
-    "башкортостан", "татарстан", "пермск", "краснодарск",
-    "приморск", "хабаровск", "красноярск",
+    "башкортостан", "татарстан",
 }
 
 def norm_city_series(s: pd.Series) -> pd.Series:
@@ -101,10 +99,8 @@ REGION_MARKERS = {
     "р", "н", "район", "рн", "п", "пос", "поселок", "с", "село",
     "д", "деревня", "рп", "х", "хутор", "ст", "ца", "станица",
 }
-# стоп-набор ТОЛЬКО для улицы (после _split_house)
 STREET_STOP_TOKENS = STREET_TYPE_TOKENS | REGION_MARKERS
 
-# маркеры корпуса (для типа, обрабатываются в _split_house)
 KORPUS_MARKERS = {"корп", "корпус", "к", "стр", "строение", "с", "лит", "литера"}
 HOUSE_MARKERS = {"д", "дом"}
 
@@ -116,7 +112,6 @@ def _tokenize(addr: str) -> list:
     return [t for t in re.split(r"[^0-9a-zа-я]+", s) if t]
 
 def _city_stems(city_norm: str) -> set:
-    """Стемы для вырезания города/региона из адреса."""
     stems = set()
     if not city_norm:
         return stems
@@ -125,7 +120,6 @@ def _city_stems(city_norm: str) -> set:
         stems.add(city_norm[:4])
     if len(city_norm) >= 5:
         stems.add(city_norm[:5])
-    # составные города (санкт-петербург, ростов-на-дону) — все части, без порога
     parts = re.split(r"[- ]+", city_norm)
     if len(parts) > 1:
         for part in parts:
@@ -136,7 +130,6 @@ def _city_stems(city_norm: str) -> set:
     return stems
 
 def _strip_tokens(tokens, city_norm):
-    """Выбрасывает стоп-слова, город и его прилагательные формы — для УЛИЦЫ."""
     stems = _city_stems(city_norm)
     out = []
     for t in tokens:
@@ -153,10 +146,6 @@ def _strip_tokens(tokens, city_norm):
 # Разбор на улицу / дом / корпус — ДО выброса стоп-слов
 # =========================================================
 def _split_house(tokens):
-    """
-    Возвращает (street_tokens_raw, house, korpus, korpus_type).
-    Маркеры (д/дом/корп/стр/с/к/лит) обрабатываются здесь и удаляются.
-    """
     street, house, korpus, korpus_type = [], "", "", ""
     seen_letter = False
     pending = None
@@ -181,13 +170,12 @@ def _split_house(tokens):
                 pending = None; pending_type = ""
             else:
                 if not seen_letter and not house and not korpus:
-                    street.append(t)          # 250-летия
+                    street.append(t)
                 elif not house:
                     house = t
                 elif not korpus:
                     korpus = t
             continue
-        # буква
         seen_letter = True
         pending = None; pending_type = ""
         street.append(t)
@@ -294,7 +282,7 @@ def _prepare_keys(df: pd.DataFrame) -> pd.DataFrame:
     key = key[
         (key["_city_norm"] != "")
         & (key["_house"] != "")
-        & (key["_street_set"] != "")   # пустая улица — не участвует
+        & (key["_street_set"] != "")
     ].copy()
     return key
 
@@ -353,7 +341,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
                     .drop_duplicates("_ap_idx", keep="first")
             )
         else:
-            # для fuzzy: лучший по ratio, при равенстве — по расстоянию
             best = (
                 cand.sort_values([rank_by, "_dist"],
                                  ascending=[False, True], na_position="last")
@@ -373,16 +360,17 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
         1,
     )
 
-    # --- Канал 2: (город, street_set, house) — корпус игнорируется ---
+    # --- Канал 2: (город, street_set, house) ---
     _apply_channel(
         fin_key.merge(ap_key, on=["_city_norm", "_street_set", "_house"], how="inner"),
         2,
     )
 
-    # --- Канал 3: fuzzy по street_sort + (город, house, street_first) ---
+    # --- Канал 3: fuzzy ---
+    # FIX: явные имена _street_sort_a / _street_sort_f, merge без suffixes
     fin_fuzzy = fin_key[["_row", "_city_norm", "_house",
                          "_street_first", "_street_sort"]].rename(
-        columns={"_row": "_row_f"}
+        columns={"_row": "_row_f", "_street_sort": "_street_sort_f"}
     )
     ap_fuzzy = ap_key[["_ap_idx", "_city_norm", "_house",
                        "_street_first", "_street_sort"]].rename(
@@ -392,7 +380,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
         fin_fuzzy,
         on=["_city_norm", "_house", "_street_first"],
         how="inner",
-        suffixes=("_a", "_f"),
     )
     if len(cand3) > 0:
         cand3 = cand3[~addr_ok[cand3["_ap_idx"].to_numpy()]]
@@ -406,7 +393,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
         cand3 = cand3[cand3["_ratio"] >= FUZZY_THRESHOLD]
         if len(cand3) > 0:
             _apply_channel(
-                cand3.rename(columns={"_row_f": "_row"})[["_row", "_ap_idx", "_ratio"]],
+                cand3[["_row_f", "_ap_idx", "_ratio"]].rename(columns={"_row_f": "_row"}),
                 3,
                 rank_by="_ratio",
             )
@@ -425,7 +412,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
                                      on=["_city_norm", "_house_base"], how="inner")
         cand4 = fin_key_uniq.merge(ap_key_uniq, on=["_city_norm", "_house_base"],
                                    how="inner", suffixes=("_f", "_a"))
-        # сверка полного дома (на случай, если _house_base != _house)
         if len(cand4) > 0:
             cand4 = cand4[cand4["_house_f"] == cand4["_house_a"]]
         if len(cand4) > 0:
