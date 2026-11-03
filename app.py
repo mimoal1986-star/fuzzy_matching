@@ -32,7 +32,7 @@ with st.sidebar:
     )
 
 st.caption(
-    f"Приоритет 1 — совпадение адреса (5 каналов: точный → fuzzy). "
+    f"Приоритет 1 — совпадение адреса (3 канала: точный → fuzzy → уникальный дом). "
     f"Приоритет 2 — координаты ≤ {EPS_M:.0f} м (жёстко). "
     f"Приоритет 3 — топ ближайших пар, добиваем до {n_target}. "
     f"Достигли {n_target} — стоп."
@@ -78,7 +78,7 @@ def norm_city_series(s: pd.Series) -> pd.Series:
     return out
 
 # =========================================================
-# Стоп-слова
+# Стоп-слова (единый список — выбрасываем всё)
 # =========================================================
 STREET_TYPE_TOKENS = {
     "ул", "улица", "пр", "прт", "проспект", "просп", "пер", "переулок",
@@ -99,13 +99,10 @@ REGION_MARKERS = {
     "р", "н", "район", "рн", "п", "пос", "поселок", "с", "село",
     "д", "деревня", "рп", "х", "хутор", "ст", "ца", "станица",
 }
-STREET_STOP_TOKENS = STREET_TYPE_TOKENS | REGION_MARKERS
-
-KORPUS_MARKERS = {"корп", "корпус", "к", "стр", "строение", "с", "лит", "литера"}
-HOUSE_MARKERS = {"д", "дом"}
+STOP_TOKENS = STREET_TYPE_TOKENS | BUILDING_MARKERS | REGION_MARKERS
 
 # =========================================================
-# Токенизация
+# Токенизация и стемы
 # =========================================================
 def _tokenize(addr: str) -> list:
     s = str(addr).lower().replace("ё", "е")
@@ -133,7 +130,7 @@ def _strip_tokens(tokens, city_norm):
     stems = _city_stems(city_norm)
     out = []
     for t in tokens:
-        if t in STREET_STOP_TOKENS:
+        if t in STOP_TOKENS:
             continue
         if any(t.startswith(s) for s in REGION_ADJ_STEMS):
             continue
@@ -143,62 +140,28 @@ def _strip_tokens(tokens, city_norm):
     return out
 
 # =========================================================
-# Разбор на улицу / дом / корпус — ДО выброса стоп-слов
-# =========================================================
-def _split_house(tokens):
-    street, house, korpus, korpus_type = [], "", "", ""
-    seen_letter = False
-    pending = None
-    pending_type = ""
-
-    for t in tokens:
-        if t in HOUSE_MARKERS:
-            pending = "house"; pending_type = ""
-            continue
-        if t in KORPUS_MARKERS:
-            pending = "korpus"; pending_type = t
-            continue
-        if t.isdigit():
-            if pending == "house":
-                if not house:
-                    house = t
-                pending = None; pending_type = ""
-            elif pending == "korpus":
-                if not korpus:
-                    korpus = t
-                    korpus_type = pending_type
-                pending = None; pending_type = ""
-            else:
-                if not seen_letter and not house and not korpus:
-                    street.append(t)
-                elif not house:
-                    house = t
-                elif not korpus:
-                    korpus = t
-            continue
-        seen_letter = True
-        pending = None; pending_type = ""
-        street.append(t)
-
-    return street, house, korpus, korpus_type
-
-# =========================================================
-# Полная нормализация адреса
+# Нормализация адреса — «мешок токенов»
 # =========================================================
 def normalize_address(addr: str, city_norm: str) -> dict:
     tokens = _tokenize(addr)
-    street_raw_tokens, house, korpus, _ktype = _split_house(tokens)
-    street_tokens = _strip_tokens(street_raw_tokens, city_norm)
-    street_sort = " ".join(sorted(street_tokens))
-    first_token = street_tokens[0] if street_tokens else ""
+    tokens = _strip_tokens(tokens, city_norm)
+    token_raw = " ".join(tokens)
+    sorted_tokens = sorted(tokens)
+    token_set = "|".join(sorted_tokens)
+    token_sort = " ".join(sorted_tokens)
+    first_token = sorted_tokens[0] if sorted_tokens else ""
+    # _house_base — последний числовой токен (для канала 3)
+    house_base = ""
+    for t in reversed(tokens):
+        if re.match(r"^\d", t):
+            house_base = t
+            break
     return {
-        "_street_set": "|".join(sorted(street_tokens)),
-        "_street_sort": street_sort,
-        "_street_raw": " ".join(street_tokens),
-        "_street_first": first_token,
-        "_house": house,
-        "_korpus": korpus,
-        "_house_base": house,
+        "_token_set": token_set,
+        "_token_sort": token_sort,
+        "_token_raw": token_raw,
+        "_first_token": first_token,
+        "_house_base": house_base,
     }
 
 # =========================================================
@@ -276,18 +239,17 @@ def load_ap(file_bytes: bytes) -> pd.DataFrame:
 def _prepare_keys(df: pd.DataFrame) -> pd.DataFrame:
     key = df.reset_index(drop=True).copy()
     key["_row"] = np.arange(len(key))
-    key = key[["_row", "_city_norm", "_street_set", "_street_sort",
-               "_street_raw", "_street_first", "_house", "_korpus",
-               "_house_base"]].copy()
-    key = key[
-        (key["_city_norm"] != "")
-        & (key["_house"] != "")
-        & (key["_street_set"] != "")
-    ].copy()
+    key = key[["_row", "_city_norm", "_token_set", "_token_sort",
+               "_token_raw", "_first_token", "_house_base"]].copy()
+    key = key[(key["_city_norm"] != "") & (key["_token_set"] != "")].copy()
     return key
 
 # =========================================================
 # Основной подбор
+#   П1 = адрес (3 канала: точный → fuzzy → уникальный дом)
+#   П2 = координаты ≤ EPS_M
+#   П3 = топ ближайших
+#   Лимит X: П1 → П2 → П3
 # =========================================================
 @st.cache_data(show_spinner=False)
 def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
@@ -353,56 +315,46 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
         addr_dist[b_a] = best["_dist"].to_numpy()
         addr_channel[b_a] = channel_no
 
-    # --- Канал 1: (город, street_set, house, korpus) ---
+    # --- Канал 1: (город, token_set) ---
     _apply_channel(
-        fin_key.merge(ap_key, on=["_city_norm", "_street_set", "_house", "_korpus"],
-                      how="inner"),
+        fin_key.merge(ap_key, on=["_city_norm", "_token_set"], how="inner"),
         1,
     )
 
-    # --- Канал 2: (город, street_set, house) ---
-    _apply_channel(
-        fin_key.merge(ap_key, on=["_city_norm", "_street_set", "_house"], how="inner"),
-        2,
+    # --- Канал 2: fuzzy по token_sort + (город, first_token) ---
+    fin_fuzzy = fin_key[["_row", "_city_norm", "_first_token",
+                         "_token_sort"]].rename(
+        columns={"_row": "_row_f", "_token_sort": "_token_sort_f"}
     )
-
-    # --- Канал 3: fuzzy ---
-    # FIX: явные имена _street_sort_a / _street_sort_f, merge без suffixes
-    fin_fuzzy = fin_key[["_row", "_city_norm", "_house",
-                         "_street_first", "_street_sort"]].rename(
-        columns={"_row": "_row_f", "_street_sort": "_street_sort_f"}
+    ap_fuzzy = ap_key[["_ap_idx", "_city_norm", "_first_token",
+                       "_token_sort"]].rename(
+        columns={"_token_sort": "_token_sort_a"}
     )
-    ap_fuzzy = ap_key[["_ap_idx", "_city_norm", "_house",
-                       "_street_first", "_street_sort"]].rename(
-        columns={"_street_sort": "_street_sort_a"}
+    cand2 = ap_fuzzy.merge(
+        fin_fuzzy, on=["_city_norm", "_first_token"], how="inner",
     )
-    cand3 = ap_fuzzy.merge(
-        fin_fuzzy,
-        on=["_city_norm", "_house", "_street_first"],
-        how="inner",
-    )
-    if len(cand3) > 0:
-        cand3 = cand3[~addr_ok[cand3["_ap_idx"].to_numpy()]]
-    if len(cand3) > 0:
+    if len(cand2) > 0:
+        cand2 = cand2[~addr_ok[cand2["_ap_idx"].to_numpy()]]
+    if len(cand2) > 0:
         ratios = np.fromiter(
             (SequenceMatcher(None, a, f).ratio()
-             for a, f in zip(cand3["_street_sort_a"], cand3["_street_sort_f"])),
-            dtype=float, count=len(cand3),
+             for a, f in zip(cand2["_token_sort_a"], cand2["_token_sort_f"])),
+            dtype=float, count=len(cand2),
         )
-        cand3 = cand3.assign(_ratio=ratios)
-        cand3 = cand3[cand3["_ratio"] >= FUZZY_THRESHOLD]
-        if len(cand3) > 0:
+        cand2 = cand2.assign(_ratio=ratios)
+        cand2 = cand2[cand2["_ratio"] >= FUZZY_THRESHOLD]
+        if len(cand2) > 0:
             _apply_channel(
-                cand3[["_row_f", "_ap_idx", "_ratio"]].rename(columns={"_row_f": "_row"}),
-                3,
+                cand2[["_row_f", "_ap_idx", "_ratio"]].rename(columns={"_row_f": "_row"}),
+                2,
                 rank_by="_ratio",
             )
 
-    # --- Канал 4: (город, house_base) при уникальной улице + полный дом ---
-    ap_uniq = (ap_key.groupby(["_city_norm", "_house_base"])["_street_set"]
-               .nunique().reset_index().rename(columns={"_street_set": "_ap_nuniq"}))
-    fin_uniq = (fin_key.groupby(["_city_norm", "_house_base"])["_street_set"]
-                .nunique().reset_index().rename(columns={"_street_set": "_fin_nuniq"}))
+    # --- Канал 3: (город, house_base) при уникальной token_set ---
+    ap_uniq = (ap_key.groupby(["_city_norm", "_house_base"])["_token_set"]
+               .nunique().reset_index().rename(columns={"_token_set": "_ap_nuniq"}))
+    fin_uniq = (fin_key.groupby(["_city_norm", "_house_base"])["_token_set"]
+                .nunique().reset_index().rename(columns={"_token_set": "_fin_nuniq"}))
     uniq = ap_uniq.merge(fin_uniq, on=["_city_norm", "_house_base"], how="inner")
     uniq = uniq[(uniq["_ap_nuniq"] == 1) & (uniq["_fin_nuniq"] == 1)]
     if len(uniq) > 0:
@@ -410,12 +362,10 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
                                    on=["_city_norm", "_house_base"], how="inner")
         fin_key_uniq = fin_key.merge(uniq[["_city_norm", "_house_base"]],
                                      on=["_city_norm", "_house_base"], how="inner")
-        cand4 = fin_key_uniq.merge(ap_key_uniq, on=["_city_norm", "_house_base"],
-                                   how="inner", suffixes=("_f", "_a"))
-        if len(cand4) > 0:
-            cand4 = cand4[cand4["_house_f"] == cand4["_house_a"]]
-        if len(cand4) > 0:
-            _apply_channel(cand4[["_row", "_ap_idx"]], 4)
+        cand3 = fin_key_uniq.merge(ap_key_uniq, on=["_city_norm", "_house_base"],
+                                   how="inner")
+        if len(cand3) > 0:
+            _apply_channel(cand3[["_row", "_ap_idx"]], 3)
 
     # ---------- П2: координаты ≤ EPS_M ----------
     ap_need_geo = ap_work[~addr_ok]
@@ -539,8 +489,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
 
     out["Канал адреса"] = np.where(addr_ok, addr_channel, 0).astype(int)
 
-    out["Улица_norm_АП"] = ap_work["_street_raw"].to_numpy()
-    out["Дом_norm_АП"] = ap_work["_house"].to_numpy()
+    out["Токены_АП"] = ap_work["_token_raw"].to_numpy()
 
     chosen_fin = np.where(addr_ok, addr_fin,
                   np.where(geo_ok, geo_fin, prio3_fin))
@@ -566,13 +515,11 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
         fin_lookup.index = out.index
         for c in fin_cols_present:
             out[c] = fin_lookup[c]
-        fin_diag = fin.loc[chosen_vals, ["_street_raw", "_house"]].copy()
+        fin_diag = fin.loc[chosen_vals, ["_token_raw"]].copy()
         fin_diag.index = out.index
-        out["Улица_norm_фин"] = fin_diag["_street_raw"]
-        out["Дом_norm_фин"] = fin_diag["_house"]
+        out["Токены_фин"] = fin_diag["_token_raw"]
     else:
-        out["Улица_norm_фин"] = np.nan
-        out["Дом_norm_фин"] = np.nan
+        out["Токены_фин"] = np.nan
 
     for c in fin_out_cols:
         if c not in out.columns:
@@ -637,25 +584,21 @@ if file_fin and file_ap:
     st.success(f"Подобрано {len(final)} из {n_target} (цель). Достигли X — стоп.")
     st.dataframe(final.head(50), use_container_width=True)
 
-    diag_fin = fin[["Адрес", "город", "_city_norm", "_street_raw",
-                    "_street_set", "_house", "_korpus", "_house_base"]].copy()
+    diag_fin = fin[["Адрес", "город", "_city_norm", "_token_raw",
+                    "_token_set", "_house_base"]].copy()
     diag_fin = diag_fin.rename(columns={
         "_city_norm": "город_norm",
-        "_street_raw": "улица",
-        "_street_set": "улица_множество",
-        "_house": "дом",
-        "_korpus": "корпус",
+        "_token_raw": "токены",
+        "_token_set": "множество",
         "_house_base": "дом_база",
     })
 
-    diag_ap = ap[["ID_Точки", "адрес", "город", "_city_norm", "_street_raw",
-                  "_street_set", "_house", "_korpus", "_house_base"]].copy()
+    diag_ap = ap[["ID_Точки", "адрес", "город", "_city_norm", "_token_raw",
+                  "_token_set", "_house_base"]].copy()
     diag_ap = diag_ap.rename(columns={
         "_city_norm": "город_norm",
-        "_street_raw": "улица",
-        "_street_set": "улица_множество",
-        "_house": "дом",
-        "_korpus": "корпус",
+        "_token_raw": "токены",
+        "_token_set": "множество",
         "_house_base": "дом_база",
     })
 
@@ -673,17 +616,15 @@ if file_fin and file_ap:
         ch1 = int((ch_counts == 1).sum())
         ch2 = int((ch_counts == 2).sum())
         ch3 = int((ch_counts == 3).sum())
-        ch4 = int((ch_counts == 4).sum())
 
         metrics = pd.DataFrame({
             "Показатель": [
                 "Цель X",
                 "Подобрано всего",
                 "Приоритет 1 (адрес), всего",
-                "  канал 1: (город, улица, дом, корпус)",
-                "  канал 2: (город, улица, дом) — корпус игнор.",
-                f"  канал 3: fuzzy улицы ≥ {FUZZY_THRESHOLD} + (город, дом)",
-                "  канал 4: (город, дом_база, уник. улица)",
+                "  канал 1: точное множество токенов",
+                f"  канал 2: fuzzy токенов ≥ {FUZZY_THRESHOLD}",
+                "  канал 3: уникальный дом в городе",
                 f"Приоритет 2 (координаты ≤ {EPS_M:.0f} м)",
                 "Приоритет 3 (ближайшие, добивка)",
                 "Осталось до X (не хватило АП)",
@@ -691,7 +632,7 @@ if file_fin and file_ap:
             "Значение": [
                 int(n_target),
                 len(final),
-                p1, ch1, ch2, ch3, ch4,
+                p1, ch1, ch2, ch3,
                 p2, p3,
                 max(0, int(n_target) - len(final)),
             ],
