@@ -1,6 +1,7 @@
 # app.py
 import re
 import io
+from difflib import SequenceMatcher
 
 import numpy as np
 import pandas as pd
@@ -14,9 +15,10 @@ st.set_page_config(
 st.title("Подбор ближайшего магазина фин-ап к возможной АП")
 
 # =========================================================
-# Жёсткий порог для Приоритета 2 (координаты)
+# Пороги
 # =========================================================
-EPS_M = 15.0  # Приоритет 2: координаты ≤ 15 м, жёстко
+EPS_M = 15.0
+FUZZY_THRESHOLD = 0.88
 
 # =========================================================
 # Сайдбар
@@ -30,7 +32,7 @@ with st.sidebar:
     )
 
 st.caption(
-    f"Приоритет 1 — совпадение адреса (4 канала). "
+    f"Приоритет 1 — совпадение адреса (5 каналов: точный → fuzzy). "
     f"Приоритет 2 — координаты ≤ {EPS_M:.0f} м (жёстко). "
     f"Приоритет 3 — топ ближайших пар, добиваем до {n_target}. "
     f"Достигли {n_target} — стоп."
@@ -43,6 +45,7 @@ CITY_SYNONYMS = {
     "питер": "санкт-петербург",
     "спб": "санкт-петербург",
     "санкт петербург": "санкт-петербург",
+    "санктпетербург": "санкт-петербург",
     "екатеренбург": "екатеринбург",
     "екб": "екатеринбург",
     "екат": "екатеринбург",
@@ -52,8 +55,19 @@ CITY_SYNONYMS = {
     "н новгород": "нижний новгород",
     "н.новгород": "нижний новгород",
     "нижнийновгород": "нижний новгород",
-    "ростовнадону": "ростов-на-дону",
+    "ростов": "ростов-на-дону",
     "ростов на дону": "ростов-на-дону",
+    "ростовнадону": "ростов-на-дону",
+}
+
+# стемы прилагательных регионов — ловят все падежи
+REGION_ADJ_STEMS = {
+    "московск", "ленинградск", "свердловск", "челябинск",
+    "нижегородск", "воронежск", "ростовск", "волгоградск",
+    "самарск", "иркутск", "омск", "новосибирск", "красноярск",
+    "пермск", "краснодарск", "приморск", "хабаровск",
+    "башкортостан", "татарстан", "пермск", "краснодарск",
+    "приморск", "хабаровск", "красноярск",
 }
 
 def norm_city_series(s: pd.Series) -> pd.Series:
@@ -66,253 +80,138 @@ def norm_city_series(s: pd.Series) -> pd.Series:
     return out
 
 # =========================================================
-# Общие регулярки
+# Стоп-слова
 # =========================================================
-TYPE_PATTERN = (
-    r"пр-кт|пр-т|проспект|пр-д|проезд|просека|просек|переулок|пер|"
-    r"бульвар|б-р|набережная|наб|площадь|пл|шоссе|ш|улица|ул|"
-    r"аллея|мкр|микрорайон|тракт|тупик|туп|спуск|съезд|дорога|дор|"
-    r"линия|квартал|кв-л|тер|проулок|протока"
-)
-TYPE_RE = re.compile(rf"\b({TYPE_PATTERN})\b\.?", re.IGNORECASE)
+STREET_TYPE_TOKENS = {
+    "ул", "улица", "пр", "прт", "проспект", "просп", "пер", "переулок",
+    "б", "бур", "бульвар", "наб", "набережная", "пл", "площадь",
+    "ш", "шоссе", "проезд", "прд", "туп", "тупик", "аллея",
+    "мкр", "микрорайон", "кв", "квартал", "квл", "линия", "тракт",
+    "дор", "дорога", "спуск", "съезд", "просек", "просека",
+    "проулок", "протока", "тер", "территория",
+}
+BUILDING_MARKERS = {
+    "д", "дом", "корп", "корпус", "к", "стр", "строение", "с",
+    "лит", "литера", "пом", "помещ", "помещение", "оф", "офис",
+    "эт", "этаж", "кв", "квартира", "нп", "вл", "владение",
+    "соор", "сооружение",
+}
+REGION_MARKERS = {
+    "г", "город", "обл", "область", "край", "респ", "республика",
+    "р", "н", "район", "рн", "п", "пос", "поселок", "с", "село",
+    "д", "деревня", "рп", "х", "хутор", "ст", "ца", "станица",
+}
+# стоп-набор ТОЛЬКО для улицы (после _split_house)
+STREET_STOP_TOKENS = STREET_TYPE_TOKENS | REGION_MARKERS
 
-GARBAGE_RE = re.compile(
-    r"\b(пом|помещ|помещение|оф|офис|эт|этаж|кв|квартира|стр|строение|"
-    r"корп|корпус|лит|литера)\b\.?\s*[\w\-/]*",
-    re.IGNORECASE,
-)
-
-REGION_CITY_RE = re.compile(
-    r"\b(респ\.?|республика|обл\.?|область|край|г\.|город|р-н|район)\s*",
-    re.IGNORECASE,
-)
-
-REGION_NAMES_RE = re.compile(
-    r"\b("
-    r"башкортостан[а]?|татарстан[а]?|"
-    r"свердловская|свердловской|челябинская|челябинской|"
-    r"нижегородская|нижегородской|воронежская|воронежской|"
-    r"ростовская|ростовской|волгоградская|волгоградской|"
-    r"самарская|самарской|иркутская|иркутской|"
-    r"калужская|калужской|омская|омской|"
-    r"новосибирская|новосибирской|"
-    r"красноярский|красноярского|пермский|пермского|"
-    r"московская|московской|ленинградская|ленинградской|"
-    r"краснодарский|краснодарского|приморский|приморского|"
-    r"хабаровский|хабаровского|забайкальский|забайкальского"
-    r")\b\.?",
-    re.IGNORECASE,
-)
-
-SETTLEMENT_RE = re.compile(
-    r"\b(?:п\.|пос\.|поселок|рп\.|рабочий поселок|с\.|село|"
-    r"д\.|деревня|кп\.|коттеджный поселок|сп\.|сп\.?|станица|ст-ца|"
-    r"х\.|хутор|мкр\.?|микрорайон)\s*(?![0-9])[а-яёa-z\-]+\s*",
-    re.IGNORECASE,
-)
-
-FIN_ADDR_HEAD_RE = re.compile(
-    rf"^(?P<type>{TYPE_PATTERN})\b\.?\s*(?P<street>.+?)\s+"
-    rf"(?P<house>[0-9]+[0-9a-zA-Zа-яА-Я/\-]*)"
-    rf"(?:\s+(?P<letter>[а-яa-z]))?"
-    rf"(?:\s*(?:корп\.?|к\.|стр\.?|с\.|лит\.?)\s*(?P<korpus>[0-9a-zA-Zа-яА-Я]+))?",
-    re.IGNORECASE,
-)
-FIN_ADDR_MID_RE = re.compile(
-    rf"^(?P<street>.+?)\s+(?P<type>{TYPE_PATTERN})\b\.?\s+"
-    rf"(?P<house>[0-9]+[0-9a-zA-Zа-яА-Я/\-]*)"
-    rf"(?:\s+(?P<letter>[а-яa-z]))?"
-    rf"(?:\s*(?:корп\.?|к\.|стр\.?|с\.|лит\.?)\s*(?P<korpus>[0-9a-zA-Zа-яА-Я]+))?",
-    re.IGNORECASE,
-)
-FIN_ADDR_FALLBACK_RE = re.compile(
-    r"^(?P<street>.+?)\s+(?P<house>[0-9]+[0-9a-zA-Zа-яА-Я/\-]*)"
-    r"(?:\s+(?P<letter>[а-яa-z]))?"
-    r"(?:\s*(?:корп\.?|к\.|стр\.?|с\.|лит\.?)\s*(?P<korpus>[0-9a-zA-Zа-яА-Я]+))?"
-    r"\s*$",
-    re.IGNORECASE,
-)
-
-HOUSE_WITH_KORPUS_RE = re.compile(
-    r"(?:д\.?|дом)\s*([0-9]+[0-9a-zA-Zа-яА-Я/\-]*)"
-    r"(?:\s*(?:корп\.?|к\.|стр\.?|с\.|лит\.?)\s*([0-9a-zA-Zа-яА-Я]+))?",
-    re.IGNORECASE,
-)
-HOUSE_KORPUS_LOOSE_RE = re.compile(
-    r"([0-9]+[0-9a-zA-Zа-яА-Я/\-]*)"
-    r"(?:\s*(?:корп\.?|к\.|стр\.?|с\.|лит\.?)\s*([0-9a-zA-Zа-яА-Я]+))?",
-    re.IGNORECASE,
-)
-
-NO_FALLBACK_MARKER_RE = re.compile(
-    r"\b(п\.|пом\.?|помещ\.?|оф\.?|офис\.?|эт\.?|этаж\.?|кв\.?|квартира)\b",
-    re.IGNORECASE,
-)
+# маркеры корпуса (для типа, обрабатываются в _split_house)
+KORPUS_MARKERS = {"корп", "корпус", "к", "стр", "строение", "с", "лит", "литера"}
+HOUSE_MARKERS = {"д", "дом"}
 
 # =========================================================
-# Канонизация дома
+# Токенизация
 # =========================================================
-def _canon_house_series(series: pd.Series) -> pd.Series:
-    s = series.astype(str).str.lower().str.replace("ё", "е", regex=False)
-    s = s.str.replace(r"\s+", "", regex=True).str.replace("-", "", regex=False)
-    s = s.str.replace(r"^0+(?=\d)", "", regex=True)
-    s = s.where(s != "nan", "")
-    s = s.where(s != "none", "")
-    return s
+def _tokenize(addr: str) -> list:
+    s = str(addr).lower().replace("ё", "е")
+    return [t for t in re.split(r"[^0-9a-zа-я]+", s) if t]
 
-def _house_base(series: pd.Series) -> pd.Series:
-    s = series.astype(str)
-    base = s.str.extract(r"^([0-9]+(?:/[0-9]+)?)")[0].fillna("")
-    return base
+def _city_stems(city_norm: str) -> set:
+    """Стемы для вырезания города/региона из адреса."""
+    stems = set()
+    if not city_norm:
+        return stems
+    stems.add(city_norm)
+    if len(city_norm) >= 4:
+        stems.add(city_norm[:4])
+    if len(city_norm) >= 5:
+        stems.add(city_norm[:5])
+    # составные города (санкт-петербург, ростов-на-дону) — все части, без порога
+    parts = re.split(r"[- ]+", city_norm)
+    if len(parts) > 1:
+        for part in parts:
+            if len(part) >= 2:
+                stems.add(part)
+                if len(part) >= 4:
+                    stems.add(part[:4])
+    return stems
 
-def _house_with_korpus(house_raw: pd.Series,
-                       letter_raw: pd.Series,
-                       korpus_raw: pd.Series) -> pd.Series:
-    h = _canon_house_series(house_raw)
-    l = _canon_house_series(letter_raw)
-    k = _canon_house_series(korpus_raw)
-    out = h.copy()
-    has_l = l.ne("") & h.ne("")
-    out.loc[has_l] = h.loc[has_l] + l.loc[has_l]
-    has_k = k.ne("") & h.ne("")
-    out.loc[has_k] = h.loc[has_k] + k.loc[has_k]
-    out.loc[h.eq("")] = ""
+def _strip_tokens(tokens, city_norm):
+    """Выбрасывает стоп-слова, город и его прилагательные формы — для УЛИЦЫ."""
+    stems = _city_stems(city_norm)
+    out = []
+    for t in tokens:
+        if t in STREET_STOP_TOKENS:
+            continue
+        if any(t.startswith(s) for s in REGION_ADJ_STEMS):
+            continue
+        if any(t == s or t.startswith(s) for s in stems):
+            continue
+        out.append(t)
     return out
 
-def _clean_street_series(series: pd.Series) -> pd.Series:
-    s = series.astype(str).str.lower().str.replace("ё", "е", regex=False)
-    s = s.str.replace(REGION_NAMES_RE, " ", regex=True)
-    s = s.str.replace(TYPE_RE, " ", regex=True)
-    s = s.str.replace(r"[.,;:\(\)\"'«»]+", " ", regex=True)
-    s = s.str.replace(r"\s+", " ", regex=True).str.strip()
-    return s
-
-INITIALS_RE = re.compile(r"\b[а-яa-z]\.(?:\s*[а-яa-z]\.)*\b", re.IGNORECASE)
-
-def _strip_initials(series: pd.Series) -> pd.Series:
-    s = series.astype(str)
-    s = s.str.replace(INITIALS_RE, " ", regex=True)
-    s = s.str.replace(r"\s+", " ", regex=True).str.strip()
-    return s
-
-def _street_first_n(series: pd.Series, n: int = 3) -> pd.Series:
-    s = _strip_initials(series)
-    return s.str.split().str[:n].str.join(" ")
-
 # =========================================================
-# Парсинг фин-апа
+# Разбор на улицу / дом / корпус — ДО выброса стоп-слов
 # =========================================================
-def _extract_fin_addr(s: pd.Series):
-    head = s.str.extract(FIN_ADDR_HEAD_RE)
-    mid = s.str.extract(FIN_ADDR_MID_RE)
-    fb = s.str.extract(FIN_ADDR_FALLBACK_RE)
+def _split_house(tokens):
+    """
+    Возвращает (street_tokens_raw, house, korpus, korpus_type).
+    Маркеры (д/дом/корп/стр/с/к/лит) обрабатываются здесь и удаляются.
+    """
+    street, house, korpus, korpus_type = [], "", "", ""
+    seen_letter = False
+    pending = None
+    pending_type = ""
 
-    street_h = head["street"].fillna("")
-    house_h = head["house"].fillna("")
-    letter_h = head["letter"].fillna("")
-    korpus_h = head["korpus"].fillna("")
-
-    street_m = mid["street"].fillna("")
-    house_m = mid["house"].fillna("")
-    letter_m = mid["letter"].fillna("")
-    korpus_m = mid["korpus"].fillna("")
-
-    street_f = fb["street"].fillna("")
-    house_f = fb["house"].fillna("")
-    letter_f = fb["letter"].fillna("")
-    korpus_f = fb["korpus"].fillna("")
-
-    use_head = house_h.ne("") & street_h.ne("")
-    use_mid = (~use_head) & house_m.ne("") & street_m.ne("")
-    use_fb = (~use_head) & (~use_mid) & house_f.ne("") & street_f.ne("")
-
-    street = np.where(use_head, street_h, np.where(use_mid, street_m, street_f))
-    house = np.where(use_head, house_h, np.where(use_mid, house_m, house_f))
-    letter = np.where(use_head, letter_h, np.where(use_mid, letter_m, letter_f))
-    korpus = np.where(use_head, korpus_h, np.where(use_mid, korpus_m, korpus_f))
-
-    street = pd.Series(street, index=s.index)
-    house = pd.Series(house, index=s.index)
-    letter = pd.Series(letter, index=s.index)
-    korpus = pd.Series(korpus, index=s.index)
-    return street, house, letter, korpus
-
-def parse_fin_series(addr: pd.Series, city: pd.Series):
-    s = addr.astype(str).str.lower().str.replace("ё", "е", regex=False)
-    s = s.str.replace(REGION_CITY_RE, " ", regex=True)
-    s = s.str.replace(SETTLEMENT_RE, " ", regex=True)
-
-    city_clean = (
-        city.fillna("").astype(str).str.lower().str.replace("ё", "е", regex=False)
-    ).to_numpy()
-    s_clean = s.fillna("").astype(str).to_numpy()
-
-    new_s = []
-    for s_i, c_i in zip(s_clean, city_clean):
-        if c_i and c_i in s_i:
-            tail = s_i.split(c_i, 1)[-1].strip()
-            if tail:
-                new_s.append(tail)
+    for t in tokens:
+        if t in HOUSE_MARKERS:
+            pending = "house"; pending_type = ""
+            continue
+        if t in KORPUS_MARKERS:
+            pending = "korpus"; pending_type = t
+            continue
+        if t.isdigit():
+            if pending == "house":
+                if not house:
+                    house = t
+                pending = None; pending_type = ""
+            elif pending == "korpus":
+                if not korpus:
+                    korpus = t
+                    korpus_type = pending_type
+                pending = None; pending_type = ""
             else:
-                new_s.append(re.sub(rf"\b{re.escape(c_i)}\b", " ", s_i).strip())
-        else:
-            new_s.append(s_i)
-    s = pd.Series(new_s, index=s.index)
+                if not seen_letter and not house and not korpus:
+                    street.append(t)          # 250-летия
+                elif not house:
+                    house = t
+                elif not korpus:
+                    korpus = t
+            continue
+        # буква
+        seen_letter = True
+        pending = None; pending_type = ""
+        street.append(t)
 
-    s = s.str.replace(GARBAGE_RE, " ", regex=True)
-    s = s.str.replace(r"\s+", " ", regex=True).str.strip()
-
-    street_raw, house_raw, letter_raw, korpus_raw = _extract_fin_addr(s)
-
-    street = _clean_street_series(street_raw)
-    house = _house_with_korpus(house_raw, letter_raw, korpus_raw)
-    return street.fillna(""), house.fillna("")
+    return street, house, korpus, korpus_type
 
 # =========================================================
-# Парсинг АП
+# Полная нормализация адреса
 # =========================================================
-def parse_ap_series(addr: pd.Series):
-    s = addr.astype(str).str.lower().str.replace("ё", "е", regex=False)
-
-    ext = s.str.extract(HOUSE_WITH_KORPUS_RE)
-    house_raw = ext[0].fillna("")
-    korpus_raw = ext[1].fillna("")
-
-    need_loose = house_raw.eq("")
-    if need_loose.any():
-        ext2 = s.loc[need_loose].str.extract(HOUSE_KORPUS_LOOSE_RE)
-        house_raw.loc[need_loose] = ext2[0].fillna("")
-        korpus_raw.loc[need_loose] = ext2[1].fillna("")
-
-    letter_raw = pd.Series("", index=s.index)
-    house = _house_with_korpus(house_raw, letter_raw, korpus_raw)
-    has_dom = house.ne("")
-
-    s = s.str.replace(GARBAGE_RE, " ", regex=True)
-    parts = s.str.split(r"(?:д\.?|дом)\s*[0-9]", n=1, regex=True, expand=True)
-    s_street = parts[0].where(has_dom, s)
-
-    fallback = s_street.str.extract(r"([0-9]+[0-9a-zA-Zа-яА-Я/]*)\s*$")
-    fallback_house = fallback[0].fillna("")
-    has_no_marker = ~s.str.contains(NO_FALLBACK_MARKER_RE)
-    need_fallback = (~has_dom) & fallback_house.ne("") & has_no_marker
-    house = house.where(has_dom, fallback_house)
-    house = _canon_house_series(house)
-    if need_fallback.any():
-        s_street.loc[need_fallback] = s_street.loc[need_fallback].str.replace(
-            r"[0-9]+[0-9a-zA-Zа-яА-Я/]*\s*$", "", regex=True
-        )
-
-    s_street = s_street.str.replace(r"[;]+", " ", regex=True)
-    s_street = s_street.str.replace(r"\s+", " ", regex=True).str.strip()
-    street = _clean_street_series(s_street)
-    return street.fillna(""), house.fillna("")
-
-def to_float_series(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(
-        s.astype(str).str.replace(",", ".", regex=False).str.replace(r"\s+", "", regex=True),
-        errors="coerce",
-    )
+def normalize_address(addr: str, city_norm: str) -> dict:
+    tokens = _tokenize(addr)
+    street_raw_tokens, house, korpus, _ktype = _split_house(tokens)
+    street_tokens = _strip_tokens(street_raw_tokens, city_norm)
+    street_sort = " ".join(sorted(street_tokens))
+    first_token = street_tokens[0] if street_tokens else ""
+    return {
+        "_street_set": "|".join(sorted(street_tokens)),
+        "_street_sort": street_sort,
+        "_street_raw": " ".join(street_tokens),
+        "_street_first": first_token,
+        "_house": house,
+        "_korpus": korpus,
+        "_house_base": house,
+    }
 
 # =========================================================
 # Haversine
@@ -328,6 +227,12 @@ def haversine_np(lat1, lon1, lat2, lon2):
     a = np.clip(a, 0.0, 1.0)
     return 2.0 * R_EARTH * np.arcsin(np.sqrt(a))
 
+def to_float_series(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        s.astype(str).str.replace(",", ".", regex=False).str.replace(r"\s+", "", regex=True),
+        errors="coerce",
+    )
+
 # =========================================================
 # Загрузка
 # =========================================================
@@ -342,6 +247,17 @@ def _check_cols(df: pd.DataFrame, required: list, name: str):
             f"Есть: {list(df.columns)}"
         )
 
+def _apply_norm(df: pd.DataFrame, addr_col: str) -> pd.DataFrame:
+    rows = [
+        normalize_address(a, c)
+        for a, c in zip(df[addr_col].astype(str).tolist(),
+                        df["_city_norm"].astype(str).tolist())
+    ]
+    norm = pd.DataFrame(rows, index=df.index)
+    for col in norm.columns:
+        df[col] = norm[col]
+    return df
+
 @st.cache_data(show_spinner=False)
 def load_fin(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_excel(io.BytesIO(file_bytes))
@@ -351,9 +267,7 @@ def load_fin(file_bytes: bytes) -> pd.DataFrame:
     df["Широта"] = to_float_series(df["Широта"])
     df["Долгота"] = to_float_series(df["Долгота"])
     df["_city_norm"] = norm_city_series(df["город"])
-    street, house = parse_fin_series(df["Адрес"], df["_city_norm"])
-    df["_street"] = street
-    df["_house"] = house
+    df = _apply_norm(df, "Адрес")
     return df
 
 @st.cache_data(show_spinner=False)
@@ -365,9 +279,7 @@ def load_ap(file_bytes: bytes) -> pd.DataFrame:
     df["Широта"] = to_float_series(df["Широта"])
     df["Долгота"] = to_float_series(df["Долгота"])
     df["_city_norm"] = norm_city_series(df["город"])
-    street, house = parse_ap_series(df["адрес"])
-    df["_street"] = street
-    df["_house"] = house
+    df = _apply_norm(df, "адрес")
     return df
 
 # =========================================================
@@ -376,20 +288,18 @@ def load_ap(file_bytes: bytes) -> pd.DataFrame:
 def _prepare_keys(df: pd.DataFrame) -> pd.DataFrame:
     key = df.reset_index(drop=True).copy()
     key["_row"] = np.arange(len(key))
-    key = key[["_row", "_city_norm", "_street", "_house"]].copy()
-    key["_house_base"] = _house_base(key["_house"])
-    key["_street3"] = _street_first_n(key["_street"], 3)
+    key = key[["_row", "_city_norm", "_street_set", "_street_sort",
+               "_street_raw", "_street_first", "_house", "_korpus",
+               "_house_base"]].copy()
     key = key[
-        (key["_street"] != "") & (key["_house"] != "") & (key["_city_norm"] != "")
+        (key["_city_norm"] != "")
+        & (key["_house"] != "")
+        & (key["_street_set"] != "")   # пустая улица — не участвует
     ].copy()
     return key
 
 # =========================================================
 # Основной подбор
-#   П1 = адрес (4 канала)
-#   П2 = координаты ≤ EPS_M (15 м)
-#   П3 = топ ближайших пар (без порога)
-#   Лимит X: П1 → П2 → П3 (П3 — ровно до остатка X)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
@@ -409,21 +319,18 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
     ap_lon_all = ap_work["Долгота"].to_numpy()
 
     fin_key = _prepare_keys(fin)
-    # FIX: ap_key должен иметь _ap_idx, а не _row
     ap_key = _prepare_keys(ap_work).rename(columns={"_row": "_ap_idx"})
 
-    # результаты по индексу ap_work (0..n_ap-1)
     addr_ok = np.zeros(n_ap, dtype=bool)
     addr_fin = np.full(n_ap, -1, dtype=int)
     addr_dist = np.full(n_ap, np.nan)
-    addr_channel = np.zeros(n_ap, dtype=int)   # 0 = не сработал, 1..4 = номер канала
+    addr_channel = np.zeros(n_ap, dtype=int)
 
     geo_ok = np.zeros(n_ap, dtype=bool)
     geo_fin = np.full(n_ap, -1, dtype=int)
     geo_dist = np.full(n_ap, np.nan)
 
-    # ---------- Приоритет 1: адресные каналы ----------
-    def _apply_channel(cand: pd.DataFrame, channel_no: int):
+    def _apply_channel(cand: pd.DataFrame, channel_no: int, rank_by: str = "_dist"):
         if len(cand) == 0:
             return
         cand = cand[~addr_ok[cand["_ap_idx"].to_numpy()]]
@@ -431,7 +338,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
             return
         f_rows = cand["_row"].to_numpy()
         a_rows = cand["_ap_idx"].to_numpy()
-
         both = fin_has_coords[f_rows]
         d = np.full(len(cand), np.nan)
         if both.any():
@@ -440,27 +346,76 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
                 ap_lat_all[a_rows[both]], ap_lon_all[a_rows[both]],
             )
         cand = cand.assign(_dist=d)
-        best = (
-            cand.sort_values("_dist", na_position="last")
-                .drop_duplicates("_ap_idx", keep="first")
-        )
+
+        if rank_by == "_dist":
+            best = (
+                cand.sort_values("_dist", na_position="last")
+                    .drop_duplicates("_ap_idx", keep="first")
+            )
+        else:
+            # для fuzzy: лучший по ratio, при равенстве — по расстоянию
+            best = (
+                cand.sort_values([rank_by, "_dist"],
+                                 ascending=[False, True], na_position="last")
+                    .drop_duplicates("_ap_idx", keep="first")
+            )
+
         b_a = best["_ap_idx"].to_numpy()
         addr_ok[b_a] = True
         addr_fin[b_a] = best["_row"].to_numpy()
         addr_dist[b_a] = best["_dist"].to_numpy()
         addr_channel[b_a] = channel_no
 
-    # канал 1: (город, улица, дом)
-    _apply_channel(fin_key.merge(ap_key, on=["_city_norm", "_street", "_house"], how="inner"), 1)
-    # канал 2: (город, улица, дом_база)
-    _apply_channel(fin_key.merge(ap_key, on=["_city_norm", "_street", "_house_base"], how="inner"), 2)
-    # канал 3: (город, улица_3слова, дом_база)
-    _apply_channel(fin_key.merge(ap_key, on=["_city_norm", "_street3", "_house_base"], how="inner"), 3)
-    # канал 4: (город, дом_база) при уникальной улице в обеих таблицах
-    ap_uniq = (ap_key.groupby(["_city_norm", "_house_base"])["_street"]
-               .nunique().reset_index().rename(columns={"_street": "_ap_nuniq"}))
-    fin_uniq = (fin_key.groupby(["_city_norm", "_house_base"])["_street"]
-                .nunique().reset_index().rename(columns={"_street": "_fin_nuniq"}))
+    # --- Канал 1: (город, street_set, house, korpus) ---
+    _apply_channel(
+        fin_key.merge(ap_key, on=["_city_norm", "_street_set", "_house", "_korpus"],
+                      how="inner"),
+        1,
+    )
+
+    # --- Канал 2: (город, street_set, house) — корпус игнорируется ---
+    _apply_channel(
+        fin_key.merge(ap_key, on=["_city_norm", "_street_set", "_house"], how="inner"),
+        2,
+    )
+
+    # --- Канал 3: fuzzy по street_sort + (город, house, street_first) ---
+    fin_fuzzy = fin_key[["_row", "_city_norm", "_house",
+                         "_street_first", "_street_sort"]].rename(
+        columns={"_row": "_row_f"}
+    )
+    ap_fuzzy = ap_key[["_ap_idx", "_city_norm", "_house",
+                       "_street_first", "_street_sort"]].rename(
+        columns={"_street_sort": "_street_sort_a"}
+    )
+    cand3 = ap_fuzzy.merge(
+        fin_fuzzy,
+        on=["_city_norm", "_house", "_street_first"],
+        how="inner",
+        suffixes=("_a", "_f"),
+    )
+    if len(cand3) > 0:
+        cand3 = cand3[~addr_ok[cand3["_ap_idx"].to_numpy()]]
+    if len(cand3) > 0:
+        ratios = np.fromiter(
+            (SequenceMatcher(None, a, f).ratio()
+             for a, f in zip(cand3["_street_sort_a"], cand3["_street_sort_f"])),
+            dtype=float, count=len(cand3),
+        )
+        cand3 = cand3.assign(_ratio=ratios)
+        cand3 = cand3[cand3["_ratio"] >= FUZZY_THRESHOLD]
+        if len(cand3) > 0:
+            _apply_channel(
+                cand3.rename(columns={"_row_f": "_row"})[["_row", "_ap_idx", "_ratio"]],
+                3,
+                rank_by="_ratio",
+            )
+
+    # --- Канал 4: (город, house_base) при уникальной улице + полный дом ---
+    ap_uniq = (ap_key.groupby(["_city_norm", "_house_base"])["_street_set"]
+               .nunique().reset_index().rename(columns={"_street_set": "_ap_nuniq"}))
+    fin_uniq = (fin_key.groupby(["_city_norm", "_house_base"])["_street_set"]
+                .nunique().reset_index().rename(columns={"_street_set": "_fin_nuniq"}))
     uniq = ap_uniq.merge(fin_uniq, on=["_city_norm", "_house_base"], how="inner")
     uniq = uniq[(uniq["_ap_nuniq"] == 1) & (uniq["_fin_nuniq"] == 1)]
     if len(uniq) > 0:
@@ -470,11 +425,13 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
                                      on=["_city_norm", "_house_base"], how="inner")
         cand4 = fin_key_uniq.merge(ap_key_uniq, on=["_city_norm", "_house_base"],
                                    how="inner", suffixes=("_f", "_a"))
-        cand4 = cand4[cand4["_house_f"] == cand4["_house_a"]]
+        # сверка полного дома (на случай, если _house_base != _house)
+        if len(cand4) > 0:
+            cand4 = cand4[cand4["_house_f"] == cand4["_house_a"]]
         if len(cand4) > 0:
             _apply_channel(cand4[["_row", "_ap_idx"]], 4)
 
-    # ---------- Приоритет 2: координаты ≤ EPS_M ----------
+    # ---------- П2: координаты ≤ EPS_M ----------
     ap_need_geo = ap_work[~addr_ok]
     if len(ap_need_geo) > 0:
         for city, ap_idx_city in ap_need_geo.groupby("_city_norm").groups.items():
@@ -521,7 +478,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
             geo_fin[a] = tmp["fin"].to_numpy()
             geo_dist[a] = tmp["d"].to_numpy()
 
-    # ---------- Приоритет 3: топ ближайших пар, без порога ----------
+    # ---------- П3: ближайший без порога ----------
     prio3_ok = np.zeros(n_ap, dtype=bool)
     prio3_fin = np.full(n_ap, -1, dtype=int)
     prio3_dist = np.full(n_ap, np.nan)
@@ -540,9 +497,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
             tree = cKDTree(fin_coords)
             ap_coords = np.column_stack([ap_lat_all[ap_idx_city],
                                           ap_lon_all[ap_idx_city]])
-
-            d_deg, idx = tree.query(ap_coords, k=1)   # градусы — только для выбора
-            # П3: расстояние в МЕТРАХ через haversine (как в П1/П2)
+            _d_deg, idx = tree.query(ap_coords, k=1)
             d_m = haversine_np(
                 ap_coords[:, 0], ap_coords[:, 1],
                 fin_coords[idx, 0], fin_coords[idx, 1],
@@ -552,7 +507,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
             prio3_fin[a] = fin_idx_city[idx]
             prio3_dist[a] = d_m
 
-    # ---------- Лимит X: П1 → П2 → П3 ----------
+    # ---------- Лимит X ----------
     taken = np.zeros(n_ap, dtype=bool)
 
     p1_idx = np.flatnonzero(addr_ok)
@@ -578,7 +533,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
             p3_order = p3_idx[np.argsort(prio3_dist[p3_idx], kind="stable")][:remaining]
             taken[p3_order] = True
 
-    # ---------- Сборка результата ----------
+    # ---------- Сборка ----------
     ap_cols_out = ["ID_Точки", "название", "адрес",
                    "Широта", "Долгота", "Полигон", "город", "тип", "сеть", "база"]
     ap_cols_present = [c for c in ap_cols_out if c in ap_work.columns]
@@ -598,14 +553,13 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
 
     out["Канал адреса"] = np.where(addr_ok, addr_channel, 0).astype(int)
 
-    out["Улица_norm_АП"] = ap_work["_street"].to_numpy()
+    out["Улица_norm_АП"] = ap_work["_street_raw"].to_numpy()
     out["Дом_norm_АП"] = ap_work["_house"].to_numpy()
 
     chosen_fin = np.where(addr_ok, addr_fin,
                   np.where(geo_ok, geo_fin, prio3_fin))
     chosen_dist = np.where(addr_ok, addr_dist,
                    np.where(geo_ok, geo_dist, prio3_dist))
-    # FIX: колонка в МЕТРАХ, имя с явной единицей
     out["Расстояние по гео,м"] = chosen_dist
 
     out["_chosen_fin"] = chosen_fin
@@ -626,9 +580,9 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
         fin_lookup.index = out.index
         for c in fin_cols_present:
             out[c] = fin_lookup[c]
-        fin_diag = fin.loc[chosen_vals, ["_street", "_house"]].copy()
+        fin_diag = fin.loc[chosen_vals, ["_street_raw", "_house"]].copy()
         fin_diag.index = out.index
-        out["Улица_norm_фин"] = fin_diag["_street"]
+        out["Улица_norm_фин"] = fin_diag["_street_raw"]
         out["Дом_norm_фин"] = fin_diag["_house"]
     else:
         out["Улица_norm_фин"] = np.nan
@@ -638,9 +592,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, n_target: int):
         if c not in out.columns:
             out[c] = np.nan
 
-    # FIX: сортировка по переименованной колонке
     out = out.sort_values(["_prio_num", "Расстояние по гео,м"], na_position="last")
-
     return out, addr_channel
 
 # =========================================================
@@ -663,7 +615,7 @@ if file_fin and file_ap:
     st.write(f"Фин ап: {len(fin)} строк. Возможная АП: {len(ap)} строк.")
 
     with st.spinner("Подбираем..."):
-        result, _channel_by_ap = match(fin, ap, int(n_target))
+        result, _channel = match(fin, ap, int(n_target))
 
     if result.empty:
         st.warning("Не удалось подобрать ни одной АП (нет координат / городов / магазинов).")
@@ -699,27 +651,26 @@ if file_fin and file_ap:
     st.success(f"Подобрано {len(final)} из {n_target} (цель). Достигли X — стоп.")
     st.dataframe(final.head(50), use_container_width=True)
 
-    # диагностические таблицы
-    diag_fin = fin[["Адрес", "город", "_city_norm", "_street", "_house"]].copy()
-    diag_fin["_house_base"] = _house_base(diag_fin["_house"])
-    diag_fin["_street3"] = _street_first_n(diag_fin["_street"], 3)
+    diag_fin = fin[["Адрес", "город", "_city_norm", "_street_raw",
+                    "_street_set", "_house", "_korpus", "_house_base"]].copy()
     diag_fin = diag_fin.rename(columns={
         "_city_norm": "город_norm",
-        "_street": "улица_norm",
-        "_house": "дом_norm",
+        "_street_raw": "улица",
+        "_street_set": "улица_множество",
+        "_house": "дом",
+        "_korpus": "корпус",
         "_house_base": "дом_база",
-        "_street3": "улица_3слова",
     })
 
-    diag_ap = ap[["ID_Точки", "адрес", "город", "_city_norm", "_street", "_house"]].copy()
-    diag_ap["_house_base"] = _house_base(diag_ap["_house"])
-    diag_ap["_street3"] = _street_first_n(diag_ap["_street"], 3)
+    diag_ap = ap[["ID_Точки", "адрес", "город", "_city_norm", "_street_raw",
+                  "_street_set", "_house", "_korpus", "_house_base"]].copy()
     diag_ap = diag_ap.rename(columns={
         "_city_norm": "город_norm",
-        "_street": "улица_norm",
-        "_house": "дом_norm",
+        "_street_raw": "улица",
+        "_street_set": "улица_множество",
+        "_house": "дом",
+        "_korpus": "корпус",
         "_house_base": "дом_база",
-        "_street3": "улица_3слова",
     })
 
     bio = io.BytesIO()
@@ -731,7 +682,7 @@ if file_fin and file_ap:
         p1 = int((final["Приоритет 1 (ДА/НЕТ)"] == "ДА").sum())
         p2 = int((final["Приоритет 2 (ДА/НЕТ)"] == "ДА").sum())
         p3 = int((final["Приоритет 3 (ДА/НЕТ)"] == "ДА").sum())
-        # разбивка П1 по каналам
+
         ch_counts = result.loc[result["Приоритет 1 (ДА/НЕТ)"] == "ДА", "Канал адреса"]
         ch1 = int((ch_counts == 1).sum())
         ch2 = int((ch_counts == 2).sum())
@@ -743,9 +694,9 @@ if file_fin and file_ap:
                 "Цель X",
                 "Подобрано всего",
                 "Приоритет 1 (адрес), всего",
-                "  канал 1: (город, улица, дом)",
-                "  канал 2: (город, улица, дом_база)",
-                "  канал 3: (город, улица_3слова, дом_база)",
+                "  канал 1: (город, улица, дом, корпус)",
+                "  канал 2: (город, улица, дом) — корпус игнор.",
+                f"  канал 3: fuzzy улицы ≥ {FUZZY_THRESHOLD} + (город, дом)",
                 "  канал 4: (город, дом_база, уник. улица)",
                 f"Приоритет 2 (координаты ≤ {EPS_M:.0f} м)",
                 "Приоритет 3 (ближайшие, добивка)",
