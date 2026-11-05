@@ -144,7 +144,27 @@ REGION_MARKERS = {
 STOP_TOKENS = STREET_TYPE_TOKENS | BUILDING_MARKERS | REGION_MARKERS
 
 # =========================================================
-# Токенизация и нормализация адреса
+# Предобработка адреса
+# FIX п.1: убран \b, вместо него (?<![а-яa-z]) — «не буква перед»
+# FIX п.2: альтернация от длинного к короткому
+# =========================================================
+def _preprocess_address(addr: str) -> str:
+    s = str(addr).lower().replace("ё", "е")
+    # составные сокращения → цельные (в т.ч. без пробела: 124пр-кт)
+    s = re.sub(r"(?<![а-яa-z])пр\s*-\s*кт(?![а-яa-z])", " проспект ", s)
+    s = re.sub(r"(?<![а-яa-z])пр\s*-\s*т(?![а-яa-z])", " проспект ", s)
+    s = re.sub(r"(?<![а-яa-z])пр\s*-\s*д(?![а-яa-z])", " проезд ", s)
+    s = re.sub(r"(?<![а-яa-z])б\s*-\s*р(?![а-яa-z])", " бульвар ", s)
+    # вырезаем пом/оф/эт/квартира + число (альтернация от длинного к короткому)
+    s = re.sub(
+        r"(?<![а-яa-z])(помещение|помещ|пом|офис|оф|этаж|эт|квартира)"
+        r"\s*\.?\s*\d+[а-я]?(?![а-яa-z0-9])",
+        " ", s,
+    )
+    return s
+
+# =========================================================
+# Токенизация, стемы, склейка дом-буквы
 # =========================================================
 def _tokenize(addr: str) -> list:
     s = str(addr).lower().replace("ё", "е")
@@ -181,9 +201,24 @@ def _strip_tokens(tokens, city_norm):
         out.append(t)
     return out
 
+def _glue_house_letter(tokens):
+    out = []
+    for t in tokens:
+        if (len(t) == 1 and t.isalpha() and out
+                and re.match(r"^\d", out[-1])):
+            out[-1] = out[-1] + t
+        else:
+            out.append(t)
+    return out
+
+# =========================================================
+# Нормализация адреса
+# =========================================================
 def normalize_address(addr: str, city_norm: str) -> dict:
-    tokens = _tokenize(addr)
+    s = _preprocess_address(addr)
+    tokens = _tokenize(s)
     tokens = _strip_tokens(tokens, city_norm)
+    tokens = _glue_house_letter(tokens)
     token_raw = " ".join(tokens)
     sorted_tokens = sorted(tokens)
     token_set = "|".join(sorted_tokens)
@@ -340,10 +375,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, city_quotas_tuple: tuple):
 
     def _apply_channel_greedy(cand: pd.DataFrame, channel_no: int, priority_no: int,
                               rank_by: str = "_dist"):
-        """
-        Жадный проход по cand (содержит _row, _ap_idx).
-        Если нет _dist — вычисляет haversine по координатам.
-        """
         if len(cand) == 0:
             return
         cand = cand[
@@ -352,8 +383,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, city_quotas_tuple: tuple):
         ]
         if len(cand) == 0:
             return
-
-        # FIX п.1: досчитываем _dist, если его нет
         if "_dist" not in cand.columns:
             f_rows = cand["_row"].to_numpy()
             a_rows = cand["_ap_idx"].to_numpy()
@@ -380,13 +409,11 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, city_quotas_tuple: tuple):
             )
 
     # ---------- П1: адресные каналы ----------
-    # канал 1: точное множество токенов
     _apply_channel_greedy(
         fin_key.merge(ap_key, on=["_city_norm", "_token_set"], how="inner"),
         1, 1,
     )
 
-    # канал 2: fuzzy по token_sort + (город, first_token)
     fin_fuzzy = fin_key[["_row", "_city_norm", "_first_token",
                          "_token_sort"]].rename(
         columns={"_row": "_row_f", "_token_sort": "_token_sort_f"}
@@ -413,10 +440,11 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, city_quotas_tuple: tuple):
             cand2 = cand2[["_row_f", "_ap_idx", "_ratio"]].rename(
                 columns={"_row_f": "_row"}
             )
-            # _dist досчитается внутри _apply_channel_greedy
             _apply_channel_greedy(cand2, 2, 1, rank_by="_ratio")
 
-    # канал 3: уникальный дом в городе
+    # ---------- Канал 3: уникальный дом + совпадение token_set ----------
+    # FIX п.6/п.7: дополнительно сверяем _token_set_f == _token_set_a,
+    # чтобы house_base от номера квартиры не давал ложных склеек
     ap_uniq = (ap_key.groupby(["_city_norm", "_house_base"])["_token_set"]
                .nunique().reset_index().rename(columns={"_token_set": "_ap_nuniq"}))
     fin_uniq = (fin_key.groupby(["_city_norm", "_house_base"])["_token_set"]
@@ -428,12 +456,19 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, city_quotas_tuple: tuple):
                                    on=["_city_norm", "_house_base"], how="inner")
         fin_key_uniq = fin_key.merge(uniq[["_city_norm", "_house_base"]],
                                      on=["_city_norm", "_house_base"], how="inner")
-        cand3 = fin_key_uniq.merge(ap_key_uniq, on=["_city_norm", "_house_base"],
-                                   how="inner")
-        # _dist досчитается внутри
-        _apply_channel_greedy(cand3[["_row", "_ap_idx"]], 3, 1)
+        cand3 = fin_key_uniq.merge(
+            ap_key_uniq,
+            on=["_city_norm", "_house_base"],
+            how="inner",
+            suffixes=("_f", "_a"),
+        )
+        # FIX: сверяем token_set_f == token_set_a
+        if len(cand3) > 0:
+            cand3 = cand3[cand3["_token_set_f"] == cand3["_token_set_a"]]
+        if len(cand3) > 0:
+            _apply_channel_greedy(cand3[["_row", "_ap_idx"]], 3, 1)
 
-    # ---------- П2: координаты ≤ EPS_M (жадно по расстоянию) ----------
+    # ---------- П2: координаты ≤ EPS_M ----------
     ap_need_geo = ap_work[~ap_taken]
     geo_candidates = []
     if len(ap_need_geo) > 0:
@@ -484,7 +519,7 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, city_quotas_tuple: tuple):
             _try_take_pair(int(row["_ap_idx"]), int(row["_row"]),
                            float(row["_dist"]), 2, 0)
 
-    # ---------- П3: k ближайших свободных (жадно) ----------
+    # ---------- П3: k ближайших свободных ----------
     ap_need_p3 = ap_work[~ap_taken]
     p3_candidates = []
     if len(ap_need_p3) > 0:
@@ -509,7 +544,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, city_quotas_tuple: tuple):
             if k == 1:
                 d_mat = d_mat[:, None]
                 idx_mat = idx_mat[:, None]
-            # векторный пересчёт в метры
             for i in range(len(ap_idx_city)):
                 valid = np.isfinite(d_mat[i])
                 if not valid.any():
@@ -555,7 +589,6 @@ def match(fin: pd.DataFrame, ap: pd.DataFrame, city_quotas_tuple: tuple):
 
     out = pd.concat([ap_part, fin_part], axis=1)
 
-    # FIX п.35: добавляем _city_norm_АП для корректных метрик по городам
     out["_city_norm_АП"] = ap_work["_city_norm"].to_numpy()[pairs_df["ap_idx"].to_numpy()]
 
     pr = pairs_df["priority"].to_numpy()
@@ -642,7 +675,6 @@ if file_fin and file_ap and total_quota > 0:
     # диагностика
     diag_fin = fin[["Адрес", "город", "_city_norm", "_token_raw", "_token_set",
                     "_house_base"]].copy()
-    # FIX п.6: fin_used корректной длины и типа
     if len(fin_used) == len(diag_fin):
         diag_fin["использован"] = np.where(fin_used, "ДА", "НЕТ")
     else:
@@ -663,7 +695,6 @@ if file_fin and file_ap and total_quota > 0:
         "_house_base": "дом_база",
     })
 
-    # FIX п.35: метрики по городам — через _city_norm_АП
     quota_rows = []
     res_city = result["_city_norm_АП"].to_numpy()
     for city, q in city_quotas.items():
@@ -707,7 +738,7 @@ if file_fin and file_ap and total_quota > 0:
                 "Приоритет 1 (адрес)",
                 "  канал 1: точное множество токенов",
                 f"  канал 2: fuzzy ≥ {FUZZY_THRESHOLD}",
-                "  канал 3: уникальный дом",
+                "  канал 3: уникальный дом + token_set",
                 f"Приоритет 2 (координаты ≤ {EPS_M:.0f} м)",
                 "Приоритет 3 (ближайший свободный)",
                 "Магазинов фин использовано",
